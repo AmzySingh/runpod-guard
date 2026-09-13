@@ -9,6 +9,11 @@ class ModelTests(unittest.TestCase):
         spec = JobSpec(repo="https://example/repo", ref="abc", command="true")
         self.assertGreater(len(spec.selected_gpus), 1)
         self.assertEqual(Artifact("out/result", Path("here")).remote, "out/result")
+        self.assertNotIn("repo", spec.receipt)
+        self.assertNotIn("command", spec.receipt)
+        self.assertNotIn("environment_sha256", spec.receipt)
+        self.assertEqual(spec.receipt["cloud"], "SECURE")
+        self.assertFalse(spec.receipt["reuse_requested"])
 
     def test_rejects_unsafe_values(self):
         with self.assertRaises(ValueError):
