@@ -68,6 +68,35 @@ class RunpodAPI:
     def create_pod(self, body: dict[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/pods", body)
 
+    def start_pod(self, pod_id: str) -> None:
+        self.request("POST", f"/pods/{pod_id}/start")
+
+    def stop_pod(self, pod_id: str) -> None:
+        self.request("POST", f"/pods/{pod_id}/stop")
+
+    def stop_and_confirm(self, pod_id: str, attempts: int = 8,
+                         sleeper: Callable[[float], None] = time.sleep) -> bool:
+        """Stop repeatedly and confirm a non-billable compute state."""
+        stopped_reads = 0
+        for attempt in range(attempts):
+            try:
+                self.stop_pod(pod_id)
+            except (RunpodAPIError, TimeoutError, OSError):
+                pass
+            sleeper(min(2 + attempt * 2, 10))
+            try:
+                pod = self.get_pod(pod_id)
+                status = pod.get("desiredStatus") or pod.get("status")
+                if status in {"EXITED", "STOPPED"}:
+                    stopped_reads += 1
+                    if stopped_reads >= 2:
+                        return True
+                else:
+                    stopped_reads = 0
+            except (RunpodAPIError, TimeoutError, OSError):
+                stopped_reads = 0
+        return False
+
     def delete_pod(self, pod_id: str) -> None:
         self.request("DELETE", f"/pods/{pod_id}")
 

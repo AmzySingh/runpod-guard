@@ -16,15 +16,29 @@ from runpod_guard.state import LeaseStore
 class FakeAPI:
     def __init__(self):
         self.deleted = []
+        self.started = []
+        self.stopped = []
         self.body = None
         self.identity = "fake-api"
+        self.pods = {}
 
     def create_pod(self, body):
         self.body = body
-        return {"id": "pod-1", "costPerHr": "0.40"}
+        pod = {"id": "pod-1", "name": body["name"], "costPerHr": "0.40",
+               "desiredStatus": "RUNNING"}
+        self.pods[pod["id"]] = pod
+        return pod
 
-    def get_pod(self, _pod_id):
-        return {"desiredStatus": "RUNNING", "publicIp": "127.0.0.1", "portMappings": {"22": 22}}
+    def get_pod(self, pod_id):
+        return {**self.pods.get(pod_id, {}), "desiredStatus": "RUNNING",
+                "publicIp": "127.0.0.1", "portMappings": {"22": 22}}
+
+    def start_pod(self, pod_id):
+        self.started.append(pod_id)
+
+    def stop_and_confirm(self, pod_id):
+        self.stopped.append(pod_id)
+        return True
 
     def delete_and_confirm(self, pod_id):
         self.deleted.append(pod_id)
@@ -65,7 +79,77 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("runpodctl pod delete", scripts[0])
             self.assertIn("while true", scripts[0])
             self.assertIn("nvidia-smi -L", scripts[1])
-            self.assertIn("git checkout --detach FETCH_HEAD", scripts[2])
+            self.assertIn("git checkout --detach --force FETCH_HEAD", scripts[2])
+
+    def test_completed_job_can_pause_for_bounded_retest_and_be_reused(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            scripts = []
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), \
+                 patch.object(runner, "_ssh", side_effect=lambda _i, _p, s, _t: scripts.append(s) or 0):
+                first = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+            self.assertTrue(first.ok)
+            self.assertTrue(first.paused)
+            self.assertFalse(first.terminated)
+            self.assertIsNotNone(first.retest_expires_at)
+            self.assertEqual(api.stopped, ["pod-1"])
+            self.assertEqual(api.body["volumeInGb"], 20)
+            self.assertEqual(api.body["volumeMountPath"], "/workspace")
+            self.assertIn("/workspace/runpod-guard-job", scripts[2])
+
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                second = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_id="pod-1",
+                ))
+            self.assertTrue(second.ok)
+            self.assertEqual(api.started, ["pod-1"])
+            self.assertEqual(api.deleted, ["pod-1"])
+
+    def test_failed_pause_falls_back_to_verified_delete(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            api.stop_and_confirm = lambda _pod_id: False
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+            self.assertTrue(result.ok)
+            self.assertFalse(result.paused)
+            self.assertTrue(result.terminated)
+            self.assertEqual(api.deleted, ["pod-1"])
+
+    def test_failed_test_is_paused_when_retest_was_requested(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            calls = 0
+
+            def ssh(_ip, _port, _script, _timeout):
+                nonlocal calls
+                calls += 1
+                return 1 if calls == 3 else 0
+
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", side_effect=ssh):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+            self.assertFalse(result.ok)
+            self.assertEqual(result.returncode, 1)
+            self.assertTrue(result.paused)
+            self.assertEqual(api.stopped, ["pod-1"])
+            self.assertEqual(api.deleted, [])
 
     def test_local_source_is_archived_uploaded_and_extracted(self):
         with tempfile.TemporaryDirectory() as root:

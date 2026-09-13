@@ -64,7 +64,7 @@ class RunpodRunner:
 
     def _pod_body(self, spec: JobSpec, name: str) -> dict:
         public_key = self._public_key()
-        return {
+        body = {
             "name": name,
             "imageName": spec.image,
             "gpuTypeIds": list(spec.selected_gpus),
@@ -72,7 +72,7 @@ class RunpodRunner:
             "cloudType": spec.cloud,
             "gpuCount": 1,
             "containerDiskInGb": spec.container_disk_gb,
-            "volumeInGb": 0,
+            "volumeInGb": spec.workspace_gb if spec.retest_window_minutes else 0,
             "ports": ["22/tcp"],
             "supportPublicIp": True,
             "interruptible": False,
@@ -80,6 +80,9 @@ class RunpodRunner:
             # account-level key injection races or differs across Pod APIs.
             "env": {**spec.env, "PUBLIC_KEY": public_key, "SSH_PUBLIC_KEY": public_key},
         }
+        if spec.retest_window_minutes:
+            body["volumeMountPath"] = "/workspace"
+        return body
 
     @staticmethod
     def _cost(pod: dict) -> float | None:
@@ -159,24 +162,31 @@ nvidia-smi -L
 """
 
     @staticmethod
-    def _job_script(spec: JobSpec) -> str:
+    def _job_script(spec: JobSpec, persistent_workspace: bool = False) -> str:
+        job_root = "/workspace/runpod-guard-job" if persistent_workspace else "/root/runpod-guard-job"
         if spec.source_dir is not None:
-            checkout = """mkdir -p /root/runpod-guard-job
-tar -xf /tmp/runpod-guard-source.tar -C /root/runpod-guard-job
+            checkout = f"""rm -rf {job_root}
+mkdir -p {job_root}
+tar -xf /tmp/runpod-guard-source.tar -C {job_root}
 rm -f /tmp/runpod-guard-source.tar
 """
         else:
             repo = shlex.quote(spec.repo or "")
             ref = shlex.quote(spec.ref)
-            checkout = f"""git clone --filter=blob:none {repo} /root/runpod-guard-job
-cd /root/runpod-guard-job
+            checkout = f"""if [ -d {job_root}/.git ]; then
+  cd {job_root}
+  git remote set-url origin {repo}
+else
+  rm -rf {job_root}
+  git clone --filter=blob:none {repo} {job_root}
+fi
+cd {job_root}
 git fetch --depth 1 origin {ref}
-git checkout --detach FETCH_HEAD
+git checkout --detach --force FETCH_HEAD
 """
         return f"""set -euo pipefail
-rm -rf /root/runpod-guard-job
 {checkout}
-cd /root/runpod-guard-job
+cd {job_root}
 mkdir -p .runpod-guard
 exec > >(tee /tmp/runpod-guard-job.log) 2>&1
 trap 'cp /tmp/runpod-guard-job.log .runpod-guard/job.log 2>/dev/null || true' EXIT
@@ -220,13 +230,15 @@ exit "$job_status"
         except subprocess.TimeoutExpired:
             return False
 
-    def _fetch(self, ip: str, port: int, artifact: Artifact, timeout: int = 120) -> bool:
+    def _fetch(self, ip: str, port: int, artifact: Artifact, timeout: int = 120,
+               persistent_workspace: bool = False) -> bool:
         local_dir = artifact.local_dir.expanduser().resolve()
         local_dir.mkdir(parents=True, exist_ok=True)
-        remote_path = "/root/runpod-guard-job/" + artifact.remote
+        job_root = "/workspace/runpod-guard-job" if persistent_workspace else "/root/runpod-guard-job"
+        remote_path = job_root + "/" + artifact.remote
         validate = f"""set -eu
 candidate=$(realpath -e -- {shlex.quote(remote_path)})
-case "$candidate" in /root/runpod-guard-job/*) exit 0;; *) exit 1;; esac
+case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
 """
         try:
             if self._ssh(ip, port, validate, min(timeout, 30)) != 0:
@@ -244,43 +256,70 @@ case "$candidate" in /root/runpod-guard-job/*) exit 0;; *) exit 1;; esac
         except subprocess.TimeoutExpired:
             return False
 
+    def _retained_lease(self, pod_id: str) -> dict:
+        now = datetime.now(timezone.utc)
+        for lease in self.leases.all():
+            if lease.get("pod_id") != pod_id or lease.get("api_identity") != self.api.identity:
+                continue
+            try:
+                expires = datetime.fromisoformat(lease["expires_at"])
+            except (KeyError, TypeError, ValueError):
+                break
+            if (expires.tzinfo is not None and lease.get("state") == "paused-for-retest" and
+                    expires > now):
+                return lease
+            break
+        raise RuntimeError(f"{pod_id} is not an unexpired Pod retained by this API identity")
+
     def execute(self, spec: JobSpec) -> JobResult:
         started = time.monotonic()
         created = datetime.now(timezone.utc)
-        # max_minutes bounds the entire billable lifetime, including provisioning
-        # and setup—not merely the user's command.
+        # max_minutes bounds provisioning, setup, and execution. An explicit retest
+        # window is recorded only after the Pod has completed and is being stopped.
         expires = created + timedelta(minutes=spec.max_minutes)
         monotonic_deadline = started + spec.max_minutes * 60
-        name = f"rpg-{spec.name[:30]}-{uuid.uuid4().hex[:8]}"
-        # Record intent before POST. If the create succeeds but its response or the
-        # caller disappears, the reaper can resolve the unique name later.
-        pending_id = f"pending-{uuid.uuid4().hex}"
-        pending_lease = {
-            "pod_id": None, "name": name, "created_at": created.isoformat(),
-            "expires_at": expires.isoformat(), "max_minutes": spec.max_minutes,
-            "api_identity": self.api.identity,
-        }
-        self.leases.put(pending_id, pending_lease)
-        try:
-            pod = self.api.create_pod(self._pod_body(spec, name))
-            if not isinstance(pod, dict) or not pod.get("id"):
-                raise RunpodAPIError("Runpod create returned no Pod ID")
-        except BaseException:
-            # A network error after Runpod accepted POST is ambiguous. Best effort
-            # cleanup now; the pending name lease remains for the scheduled reaper.
+        pending_id: str | None = None
+        retained_lease: dict | None = None
+        if spec.reuse_pod_id:
+            retained_lease = self._retained_lease(spec.reuse_pod_id)
+            pod = self.api.get_pod(spec.reuse_pod_id)
+            name = str(retained_lease["name"])
+            if pod.get("name") != name:
+                raise RuntimeError("retained Pod name no longer matches its local lease")
+        else:
+            name = f"rpg-{spec.name[:30]}-{uuid.uuid4().hex[:8]}"
+            # Record intent before POST. If creation succeeds but its response or the
+            # caller disappears, the reaper can resolve the unique name later.
+            pending_id = f"pending-{uuid.uuid4().hex}"
+            self.leases.put(pending_id, {
+                "pod_id": None, "name": name, "created_at": created.isoformat(),
+                "expires_at": expires.isoformat(), "max_minutes": spec.max_minutes,
+                "api_identity": self.api.identity, "state": "creating",
+            })
             try:
-                for candidate in self.api.list_pods():
-                    if candidate.get("name") == name and candidate.get("id"):
-                        self.api.delete_and_confirm(candidate["id"])
-            except RunpodAPIError:
-                pass
-            raise
+                pod = self.api.create_pod(self._pod_body(spec, name))
+                if not isinstance(pod, dict) or not pod.get("id"):
+                    raise RunpodAPIError("Runpod create returned no Pod ID")
+            except BaseException:
+                # A network error after Runpod accepted POST is ambiguous. Best effort
+                # cleanup now; the pending name lease remains for the scheduled reaper.
+                try:
+                    for candidate in self.api.list_pods():
+                        if candidate.get("name") == name and candidate.get("id"):
+                            self.api.delete_and_confirm(candidate["id"])
+                except RunpodAPIError:
+                    pass
+                raise
         pod_id = pod["id"]
         cost = self._cost(pod)
         terminated = False
+        paused = False
+        retest_expires_at: str | None = None
         returncode: int | None = None
         timed_out = False
         artifacts_ok = True
+        command_finished = False
+        persistent_workspace = bool(spec.retest_window_minutes or spec.reuse_pod_id)
         ip: str | None = None
         port: int | None = None
         previous_handlers: dict[int, object] = {}
@@ -298,10 +337,14 @@ case "$candidate" in /root/runpod-guard-job/*) exit 0;; *) exit 1;; esac
             self.leases.put(pod_id, {
                 "pod_id": pod_id, "name": name, "created_at": created.isoformat(),
                 "expires_at": expires.isoformat(), "max_minutes": spec.max_minutes,
-                "api_identity": self.api.identity,
+                "api_identity": self.api.identity, "state": "running",
             })
-            self.leases.remove(pending_id)
-            self._log(f"created {pod_id} ({name}); hard deadline {expires.isoformat()}")
+            if pending_id:
+                self.leases.remove(pending_id)
+                self._log(f"created {pod_id} ({name}); hard deadline {expires.isoformat()}")
+            else:
+                self.api.start_pod(pod_id)
+                self._log(f"restarting retained Pod {pod_id}; hard deadline {expires.isoformat()}")
             if threading.current_thread() is threading.main_thread():
                 for signum in (signal.SIGINT, signal.SIGTERM):
                     previous_handlers[signum] = signal.signal(signum, interrupted)
@@ -316,7 +359,8 @@ case "$candidate" in /root/runpod-guard-job/*) exit 0;; *) exit 1;; esac
             self._wait_for_ssh(ip, port, min(300, remaining()))
             # Five minutes beyond the local deadline is enough for ordinary local
             # teardown, but still bounds spend if this process or host disappears.
-            if self._ssh(ip, port, self._watchdog_script(pod_id, remaining() + 300), 60) != 0:
+            watchdog_seconds = remaining() + 300
+            if self._ssh(ip, port, self._watchdog_script(pod_id, watchdog_seconds), 60) != 0:
                 raise RuntimeError("could not arm the independent on-Pod termination watchdog")
             self._log("independent on-Pod watchdog armed")
             if self._ssh(ip, port, self._bootstrap_script(), min(60, remaining())) != 0:
@@ -333,7 +377,10 @@ case "$candidate" in /root/runpod-guard-job/*) exit 0;; *) exit 1;; esac
                 job_budget = remaining() - reserve
                 if job_budget <= 0:
                     raise TimeoutError("no execution budget remains after provisioning")
-                returncode = self._ssh(ip, port, self._job_script(spec), job_budget)
+                returncode = self._ssh(
+                    ip, port, self._job_script(spec, persistent_workspace), job_budget
+                )
+                command_finished = True
             except (subprocess.TimeoutExpired, TimeoutError):
                 timed_out = True
                 self._log("job reached its local deadline")
@@ -345,7 +392,7 @@ case "$candidate" in /root/runpod-guard-job/*) exit 0;; *) exit 1;; esac
                         except TimeoutError:
                             fetch_budget = 0
                         fetched = fetch_budget > 0 and self._fetch(
-                            ip, port, artifact, fetch_budget
+                            ip, port, artifact, fetch_budget, persistent_workspace
                         )
                         if artifact.required and not fetched:
                             artifacts_ok = False
@@ -355,20 +402,45 @@ case "$candidate" in /root/runpod-guard-job/*) exit 0;; *) exit 1;; esac
                 for signum in (signal.SIGINT, signal.SIGTERM):
                     signal.signal(signum, signal.SIG_IGN)
             try:
-                self._log(f"terminating {pod_id}")
-                try:
-                    terminated = self.api.delete_and_confirm(pod_id)
-                except Exception as error:
-                    self._log(f"delete failed for {pod_id}: {error}")
-                    terminated = False
+                if command_finished and spec.retest_window_minutes:
+                    retest_expires = datetime.now(timezone.utc) + timedelta(
+                        minutes=spec.retest_window_minutes
+                    )
+                    try:
+                        self.leases.put(pod_id, {
+                            "pod_id": pod_id, "name": name,
+                            "created_at": created.isoformat(),
+                            "expires_at": retest_expires.isoformat(),
+                            "max_minutes": spec.max_minutes,
+                            "api_identity": self.api.identity,
+                            "state": "paused-for-retest",
+                        })
+                        self._log(f"pausing {pod_id} for a bounded retest window")
+                        paused = self.api.stop_and_confirm(pod_id)
+                    except Exception as error:
+                        self._log(f"pause failed for {pod_id}: {error}")
+                        paused = False
+                    if paused:
+                        retest_expires_at = retest_expires.isoformat()
+                        self._log(
+                            f"confirmed {pod_id} is stopped; reaper deadline {retest_expires_at}"
+                        )
+                if not paused:
+                    self._log(f"terminating {pod_id}")
+                    try:
+                        terminated = self.api.delete_and_confirm(pod_id)
+                    except Exception as error:
+                        self._log(f"delete failed for {pod_id}: {error}")
+                        terminated = False
                 if terminated:
                     try:
                         self.leases.remove(pod_id)
-                        self.leases.remove(pending_id)
+                        if pending_id:
+                            self.leases.remove(pending_id)
                     except Exception as error:
                         self._log(f"Pod is gone but lease cleanup failed for {pod_id}: {error}")
                     self._log(f"confirmed {pod_id} is gone")
-                else:
+                elif not paused:
                     self._log(f"CRITICAL: could not confirm {pod_id} is gone; run `runpod-guard reap`")
             finally:
                 for signum, handler in previous_handlers.items():
@@ -378,6 +450,7 @@ case "$candidate" in /root/runpod-guard-job/*) exit 0;; *) exit 1;; esac
             pod_id=pod_id, returncode=returncode, timed_out=timed_out,
             artifacts_ok=artifacts_ok, terminated=terminated,
             elapsed_seconds=time.monotonic() - started, cost_per_hour=cost,
+            paused=paused, retest_expires_at=retest_expires_at,
         )
 
     def reap(self, all_managed: bool = False) -> list[str]:

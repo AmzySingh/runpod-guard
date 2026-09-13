@@ -18,6 +18,11 @@ class ModelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             JobSpec(repo="https://example/repo", ref="y", command="z", max_minutes=0)
         with self.assertRaises(ValueError):
+            JobSpec(repo="https://example/repo", ref="y", command="z",
+                    retest_window_minutes=1441)
+        with self.assertRaises(ValueError):
+            JobSpec(repo="https://example/repo", ref="y", command="z", reuse_pod_id="bad/id")
+        with self.assertRaises(ValueError):
             JobSpec(repo="https://example/repo", ref="y", command="z", max_cost_per_hour=float("nan"))
         with self.assertRaises(ValueError):
             JobSpec(repo="https://example/repo", ref="y", command="z", env={"RUNPOD_API_KEY": "secret"})

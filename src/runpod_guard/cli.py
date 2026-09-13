@@ -52,7 +52,7 @@ def parser() -> argparse.ArgumentParser:
     reap.add_argument("--all-managed", action="store_true",
                       help="delete every Pod whose name starts rpg-, even before its deadline")
 
-    run = subcommands.add_parser("run", help="run one bounded disposable job")
+    run = subcommands.add_parser("run", help="run one bounded job")
     source = run.add_mutually_exclusive_group(required=True)
     source.add_argument("--repo", help="public HTTPS Git repository")
     source.add_argument("--source", type=Path,
@@ -68,6 +68,11 @@ def parser() -> argparse.ArgumentParser:
                      help="post-allocation hourly-rate ceiling (default: 1.00)")
     run.add_argument("--image", default="runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404")
     run.add_argument("--disk-gb", type=int, default=40)
+    run.add_argument("--workspace-gb", type=int, default=20,
+                     help="persistent workspace size when retaining for a retest (default: 20)")
+    run.add_argument("--retest-window-minutes", type=int, default=0,
+                     help="stop instead of delete after a completed job; reaper deletes at expiry")
+    run.add_argument("--reuse-pod", help="restart a Pod retained by an earlier guarded run")
     run.add_argument("--fetch", action="append", type=artifact, default=[])
     run.add_argument("--name", default="job")
     return command
@@ -97,6 +102,9 @@ def main(argv: list[str] | None = None) -> int:
         profile=args.profile, gpu_types=tuple(args.gpu), cloud=args.cloud,
         max_minutes=args.max_minutes, max_cost_per_hour=args.max_cost_per_hour,
         image=args.image, container_disk_gb=args.disk_gb,
+        workspace_gb=args.workspace_gb,
+        retest_window_minutes=args.retest_window_minutes,
+        reuse_pod_id=args.reuse_pod,
         artifacts=tuple(args.fetch), name=args.name,
     )
     result = runner.execute(spec)
