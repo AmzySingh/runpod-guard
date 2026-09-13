@@ -8,6 +8,17 @@ from runpod_guard.state import LeaseStore
 
 
 class StateTests(unittest.TestCase):
+    def test_claim_is_exclusive_and_released(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = LeaseStore(Path(root))
+            second = LeaseStore(Path(root))
+            with first.claim("pod-1"):
+                with self.assertRaisesRegex(RuntimeError, "already claimed"):
+                    with second.claim("pod-1"):
+                        pass
+            with second.claim("pod-1"):
+                pass
+
     def test_corrupt_records_do_not_hide_valid_expiry(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root)

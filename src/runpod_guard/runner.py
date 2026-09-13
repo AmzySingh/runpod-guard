@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import os
+from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
 import math
+import os
 import shlex
 import signal
 import subprocess
@@ -9,7 +11,6 @@ import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -272,6 +273,12 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
         raise RuntimeError(f"{pod_id} is not an unexpired Pod retained by this API identity")
 
     def execute(self, spec: JobSpec) -> JobResult:
+        if spec.reuse_pod_id:
+            with self.leases.claim(spec.reuse_pod_id):
+                return self._execute(spec)
+        return self._execute(spec)
+
+    def _execute(self, spec: JobSpec) -> JobResult:
         started = time.monotonic()
         created = datetime.now(timezone.utc)
         # max_minutes bounds provisioning, setup, and execution. An explicit retest
@@ -286,6 +293,12 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             name = str(retained_lease["name"])
             if pod.get("name") != name:
                 raise RuntimeError("retained Pod name no longer matches its local lease")
+            status = pod.get("desiredStatus") or pod.get("status")
+            if status not in {"EXITED", "STOPPED"}:
+                if not self.api.stop_and_confirm(spec.reuse_pod_id):
+                    if self.api.delete_and_confirm(spec.reuse_pod_id):
+                        self.leases.remove(spec.reuse_pod_id)
+                    raise RuntimeError("retained Pod could not be confirmed stopped before reuse")
         else:
             name = f"rpg-{spec.name[:30]}-{uuid.uuid4().hex[:8]}"
             # Record intent before POST. If creation succeeds but its response or the
@@ -318,7 +331,8 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
         returncode: int | None = None
         timed_out = False
         artifacts_ok = True
-        command_finished = False
+        job_started = False
+        job_retestable = False
         persistent_workspace = bool(spec.retest_window_minutes or spec.reuse_pod_id)
         ip: str | None = None
         port: int | None = None
@@ -377,12 +391,14 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 job_budget = remaining() - reserve
                 if job_budget <= 0:
                     raise TimeoutError("no execution budget remains after provisioning")
+                job_started = True
                 returncode = self._ssh(
                     ip, port, self._job_script(spec, persistent_workspace), job_budget
                 )
-                command_finished = True
+                job_retestable = True
             except (subprocess.TimeoutExpired, TimeoutError):
                 timed_out = True
+                job_retestable = job_started
                 self._log("job reached its local deadline")
             finally:
                 if ip is not None and port is not None:
@@ -402,21 +418,22 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 for signum in (signal.SIGINT, signal.SIGTERM):
                     signal.signal(signum, signal.SIG_IGN)
             try:
-                if command_finished and spec.retest_window_minutes:
+                if job_retestable and spec.retest_window_minutes:
                     retest_expires = datetime.now(timezone.utc) + timedelta(
                         minutes=spec.retest_window_minutes
                     )
                     try:
-                        self.leases.put(pod_id, {
-                            "pod_id": pod_id, "name": name,
-                            "created_at": created.isoformat(),
-                            "expires_at": retest_expires.isoformat(),
-                            "max_minutes": spec.max_minutes,
-                            "api_identity": self.api.identity,
-                            "state": "paused-for-retest",
-                        })
                         self._log(f"pausing {pod_id} for a bounded retest window")
-                        paused = self.api.stop_and_confirm(pod_id)
+                        if self.api.stop_and_confirm(pod_id):
+                            self.leases.put(pod_id, {
+                                "pod_id": pod_id, "name": name,
+                                "created_at": created.isoformat(),
+                                "expires_at": retest_expires.isoformat(),
+                                "max_minutes": spec.max_minutes,
+                                "api_identity": self.api.identity,
+                                "state": "paused-for-retest",
+                            })
+                            paused = True
                     except Exception as error:
                         self._log(f"pause failed for {pod_id}: {error}")
                         paused = False
@@ -425,6 +442,27 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                         self._log(
                             f"confirmed {pod_id} is stopped; reaper deadline {retest_expires_at}"
                         )
+                elif retained_lease is not None and not job_started:
+                    # Reacquiring a GPU can fail normally. Preserve the existing
+                    # workspace/window if the Pod can still be proven stopped.
+                    original_expires = datetime.fromisoformat(retained_lease["expires_at"])
+                    try:
+                        if (original_expires > datetime.now(timezone.utc) and
+                                self.api.stop_and_confirm(pod_id)):
+                            original = {
+                                key: value for key, value in retained_lease.items()
+                                if key != "_path"
+                            }
+                            self.leases.put(pod_id, original)
+                            paused = True
+                            retest_expires_at = original_expires.isoformat()
+                            self._log(
+                                f"restart failed; {pod_id} remains stopped until "
+                                f"{retest_expires_at}"
+                            )
+                    except Exception as error:
+                        self._log(f"could not restore stopped Pod {pod_id}: {error}")
+                        paused = False
                 if not paused:
                     self._log(f"terminating {pod_id}")
                     try:
@@ -480,11 +518,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             except Exception as error:
                 self.reap_failures.append(f"could not remove lease {lease_id}: {error}")
 
-        for pod_id in sorted(candidates - {None}):
-            if pod_id not in pods:
-                if pod_id not in first_pods:
-                    remove_lease(pod_id)
-                continue
+        def delete_candidate(pod_id: str) -> None:
             delete_errored = False
             try:
                 confirmed = self.api.delete_and_confirm(pod_id)
@@ -497,6 +531,32 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 removed.append(pod_id)
             elif not delete_errored:
                 self.reap_failures.append(f"could not confirm deletion of {pod_id}")
+
+        for pod_id in sorted(candidates - {None}):
+            if pod_id not in pods:
+                if pod_id not in first_pods:
+                    remove_lease(pod_id)
+                continue
+            if all_managed:
+                delete_candidate(pod_id)
+                continue
+            claim = getattr(self.leases, "claim", None)
+            try:
+                with claim(pod_id) if claim else nullcontext():
+                    # A reuse caller may have renewed a lease after the first
+                    # expiry snapshot but before this lock was acquired.
+                    current_expired = self.leases.expired()
+                    pod_name = pods[pod_id].get("name")
+                    still_expired = any(
+                        lease.get("api_identity") == self.api.identity and
+                        (lease.get("pod_id") == pod_id or lease.get("name") == pod_name)
+                        for lease in current_expired
+                    )
+                    if still_expired:
+                        delete_candidate(pod_id)
+            except RuntimeError as error:
+                if "already claimed by another retest" not in str(error):
+                    self.reap_failures.append(f"could not claim {pod_id}: {error}")
         # Clear expired pending intents once no current Pod has their unique name.
         first_names = {pod.get("name") for pod in first_pods.values()}
         live_names = {pod.get("name") for pod in pods.values()}

@@ -8,6 +8,7 @@ import signal
 from pathlib import Path
 from unittest.mock import patch
 
+from runpod_guard.api import RunpodAPIError
 from runpod_guard.models import JobSpec
 from runpod_guard.runner import RunpodRunner
 from runpod_guard.state import LeaseStore
@@ -30,14 +31,16 @@ class FakeAPI:
         return pod
 
     def get_pod(self, pod_id):
-        return {**self.pods.get(pod_id, {}), "desiredStatus": "RUNNING",
-                "publicIp": "127.0.0.1", "portMappings": {"22": 22}}
+        return {**self.pods.get(pod_id, {}), "publicIp": "127.0.0.1",
+                "portMappings": {"22": 22}}
 
     def start_pod(self, pod_id):
         self.started.append(pod_id)
+        self.pods[pod_id]["desiredStatus"] = "RUNNING"
 
     def stop_and_confirm(self, pod_id):
         self.stopped.append(pod_id)
+        self.pods[pod_id]["desiredStatus"] = "EXITED"
         return True
 
     def delete_and_confirm(self, pod_id):
@@ -148,6 +151,91 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertEqual(result.returncode, 1)
             self.assertTrue(result.paused)
+            self.assertEqual(api.stopped, ["pod-1"])
+            self.assertEqual(api.deleted, [])
+
+    def test_timeout_after_execution_starts_is_paused_for_retest(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            calls = 0
+
+            def ssh(_ip, _port, _script, timeout):
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    raise subprocess.TimeoutExpired("ssh", timeout)
+                return 0
+
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", side_effect=ssh):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+            self.assertTrue(result.timed_out)
+            self.assertTrue(result.paused)
+            self.assertEqual(api.deleted, [])
+
+    def test_unconfirmed_stop_and_delete_keep_short_running_lease(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            api.stop_and_confirm = lambda _pod_id: False
+            api.delete_and_confirm = lambda _pod_id: False
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=60,
+                ))
+            self.assertFalse(result.ok)
+            lease = runner.leases.all()[0]
+            self.assertEqual(lease["state"], "running")
+            self.assertEqual(lease["max_minutes"], 10)
+
+    def test_concurrent_reuse_claim_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+            with runner.leases.claim("pod-1"), self.assertRaisesRegex(
+                    RuntimeError, "already claimed"):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_id="pod-1",
+                ))
+            self.assertEqual(api.started, [])
+            self.assertEqual(api.deleted, [])
+
+    def test_restart_failure_restores_original_paused_lease(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                first = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+            original_expiry = first.retest_expires_at
+            api.stopped.clear()
+            api.start_pod = lambda _pod_id: (_ for _ in ()).throw(
+                RunpodAPIError("GPU is no longer available")
+            )
+            with self.assertRaises(RunpodAPIError):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_id="pod-1",
+                ))
+            lease = runner.leases.all()[0]
+            self.assertEqual(lease["state"], "paused-for-retest")
+            self.assertEqual(lease["expires_at"], original_expiry)
             self.assertEqual(api.stopped, ["pod-1"])
             self.assertEqual(api.deleted, [])
 
@@ -284,6 +372,23 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(removed, ["z-live"])
             self.assertEqual(api.deleted, ["z-live"])
             self.assertTrue(runner.reap_failures)
+
+    def test_reaper_skips_a_pod_claimed_by_active_retest(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            api.pods["pod-1"] = {"id": "pod-1", "name": "rpg-tests-1234"}
+            api.list_pods = lambda: list(api.pods.values())
+            runner = self.runner(root, api)
+            runner.leases.put("pod-1", {
+                "pod_id": "pod-1", "name": "rpg-tests-1234",
+                "expires_at": "2020-01-01T00:00:00+00:00",
+                "api_identity": api.identity, "state": "running",
+            })
+            with runner.leases.claim("pod-1"), patch("runpod_guard.runner.time.sleep"):
+                removed = runner.reap()
+            self.assertEqual(removed, [])
+            self.assertEqual(api.deleted, [])
+            self.assertEqual(runner.reap_failures, [])
 
 
 if __name__ == "__main__":
