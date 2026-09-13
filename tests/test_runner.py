@@ -83,6 +83,7 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("while true", scripts[0])
             self.assertIn("nvidia-smi -L", scripts[1])
             self.assertIn("git checkout --detach --force FETCH_HEAD", scripts[2])
+            self.assertNotIn("--filter", scripts[2])
 
     def test_completed_job_can_pause_for_bounded_retest_and_be_reused(self):
         with tempfile.TemporaryDirectory() as root:
@@ -104,6 +105,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(api.body["volumeInGb"], 20)
             self.assertEqual(api.body["volumeMountPath"], "/workspace")
             self.assertIn("/workspace/runpod-guard-job", scripts[2])
+            self.assertIn("RUNPOD_GUARD_CACHE=/workspace/runpod-guard-cache", scripts[2])
 
             with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
                  patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
@@ -114,6 +116,52 @@ class RunnerTests(unittest.TestCase):
             self.assertTrue(second.ok)
             self.assertEqual(api.started, ["pod-1"])
             self.assertEqual(api.deleted, ["pod-1"])
+
+    def test_reuse_rejects_changed_immutable_pod_configuration(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+            with self.assertRaisesRegex(RuntimeError, "configuration differs"):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    image="different/image", max_minutes=10, reuse_pod_id="pod-1",
+                ))
+            self.assertEqual(api.started, [])
+            self.assertEqual(api.deleted, [])
+            self.assertEqual(runner.leases.all()[0]["state"], "paused-for-retest")
+
+    def test_reuse_checks_refreshed_running_cost(self):
+        class ChangingCostAPI(FakeAPI):
+            def get_pod(self, pod_id):
+                pod = super().get_pod(pod_id)
+                pod["costPerHr"] = "0.80" if pod.get("desiredStatus") == "RUNNING" else "0.01"
+                return pod
+
+        with tempfile.TemporaryDirectory() as root:
+            api = ChangingCostAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, max_cost_per_hour=1.0, retest_window_minutes=15,
+                ))
+            api.stopped.clear()
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 self.assertRaisesRegex(RuntimeError, "above.*limit"):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, max_cost_per_hour=0.5, reuse_pod_id="pod-1",
+                ))
+            self.assertEqual(api.started, ["pod-1"])
+            self.assertEqual(api.stopped, ["pod-1"])
+            self.assertEqual(api.deleted, [])
 
     def test_failed_pause_falls_back_to_verified_delete(self):
         with tempfile.TemporaryDirectory() as root:
