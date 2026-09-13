@@ -26,7 +26,7 @@ class FakeAPI:
     def create_pod(self, body):
         self.body = body
         pod = {"id": "pod-1", "name": body["name"], "costPerHr": "0.40",
-               "desiredStatus": "RUNNING"}
+               "desiredStatus": "RUNNING", "env": dict(body["env"])}
         self.pods[pod["id"]] = pod
         return pod
 
@@ -160,6 +160,59 @@ class RunnerTests(unittest.TestCase):
                 ))
             self.assertEqual(api.started, [])
             self.assertEqual(api.deleted, [])
+
+    def test_reuse_upgrades_legacy_lease_after_verifying_pod_ssh_key(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+
+            lease = runner.leases.all()[0]
+            lease["pod_configuration"].pop("ssh_public_key_sha256")
+            runner.leases.put("pod-1", {key: value for key, value in lease.items() if key != "_path"})
+            api.start_pod = lambda _pod_id: (_ for _ in ()).throw(
+                RunpodAPIError("GPU is no longer available")
+            )
+            with self.assertRaises(RunpodAPIError):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_id="pod-1",
+                ))
+            upgraded = runner.leases.all()[0]["pod_configuration"]
+            self.assertIn("ssh_public_key_sha256", upgraded)
+            self.assertEqual(api.started, [])
+
+    def test_reuse_rejects_legacy_lease_when_pod_ssh_key_does_not_match(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+
+            lease = runner.leases.all()[0]
+            lease["pod_configuration"].pop("ssh_public_key_sha256")
+            runner.leases.put("pod-1", {key: value for key, value in lease.items() if key != "_path"})
+            api.pods["pod-1"]["env"]["SSH_PUBLIC_KEY"] = "different"
+            with self.assertRaisesRegex(RuntimeError, "does not match.*SSH public key"):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_id="pod-1",
+                ))
+            self.assertEqual(api.started, [])
+            self.assertEqual(api.deleted, [])
+            self.assertNotIn(
+                "ssh_public_key_sha256",
+                runner.leases.all()[0]["pod_configuration"],
+            )
 
     def test_reuse_checks_refreshed_running_cost(self):
         class ChangingCostAPI(FakeAPI):
