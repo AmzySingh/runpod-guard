@@ -32,6 +32,8 @@ class ModelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             JobSpec(repo="https://example/repo", ref="y", command="z", env={"RUNPOD_API_KEY": "secret"})
         with self.assertRaises(ValueError):
+            JobSpec(repo="https://example/repo", ref="y", command="z", env={"PUBLIC_KEY": "ignored"})
+        with self.assertRaises(ValueError):
             JobSpec(repo="file:///tmp/repo", ref="y", command="z")
         with self.assertRaises(ValueError):
             JobSpec(repo="https://example/repo", ref="--upload-pack=bad", command="z")

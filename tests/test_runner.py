@@ -136,6 +136,31 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(api.deleted, [])
             self.assertEqual(runner.leases.all()[0]["state"], "paused-for-retest")
 
+    def test_reuse_rejects_changed_ssh_key_before_starting_pod(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+
+            replacement_key = Path(root) / "replacement-key"
+            subprocess.run(
+                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(replacement_key)],
+                check=True,
+            )
+            runner.ssh_key = replacement_key
+            with self.assertRaisesRegex(RuntimeError, "configuration differs"):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_id="pod-1",
+                ))
+            self.assertEqual(api.started, [])
+            self.assertEqual(api.deleted, [])
+
     def test_reuse_checks_refreshed_running_cost(self):
         class ChangingCostAPI(FakeAPI):
             def get_pod(self, pod_id):

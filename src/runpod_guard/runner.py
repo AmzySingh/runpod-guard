@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
+import hashlib
 import math
 import os
 import shlex
@@ -63,8 +64,8 @@ class RunpodRunner:
             raise RuntimeError(f"SSH public key does not match private key: {path}")
         return value
 
-    def _pod_body(self, spec: JobSpec, name: str) -> dict:
-        public_key = self._public_key()
+    def _pod_body(self, spec: JobSpec, name: str, public_key: str | None = None) -> dict:
+        public_key = public_key or self._public_key()
         body = {
             "name": name,
             "imageName": spec.image,
@@ -290,6 +291,11 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
     def _execute(self, spec: JobSpec) -> JobResult:
         started = time.monotonic()
         created = datetime.now(timezone.utc)
+        public_key = self._public_key()
+        pod_configuration = {
+            **spec.pod_configuration,
+            "ssh_public_key_sha256": hashlib.sha256(public_key.encode()).hexdigest(),
+        }
         # max_minutes bounds provisioning, setup, and execution. An explicit retest
         # window is recorded only after the Pod has completed and is being stopped.
         expires = created + timedelta(minutes=spec.max_minutes)
@@ -298,7 +304,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
         retained_lease: dict | None = None
         if spec.reuse_pod_id:
             retained_lease = self._retained_lease(spec.reuse_pod_id)
-            if retained_lease.get("pod_configuration") != spec.pod_configuration:
+            if retained_lease.get("pod_configuration") != pod_configuration:
                 raise RuntimeError("retained Pod configuration differs from the requested job")
             pod = self.api.get_pod(spec.reuse_pod_id)
             name = str(retained_lease["name"])
@@ -321,7 +327,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 "api_identity": self.api.identity, "state": "creating",
             })
             try:
-                pod = self.api.create_pod(self._pod_body(spec, name))
+                pod = self.api.create_pod(self._pod_body(spec, name, public_key))
                 if not isinstance(pod, dict) or not pod.get("id"):
                     raise RunpodAPIError("Runpod create returned no Pod ID")
             except BaseException:
@@ -363,7 +369,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 "pod_id": pod_id, "name": name, "created_at": created.isoformat(),
                 "expires_at": expires.isoformat(), "max_minutes": spec.max_minutes,
                 "api_identity": self.api.identity, "state": "running",
-                "pod_configuration": spec.pod_configuration,
+                "pod_configuration": pod_configuration,
             })
             if pending_id:
                 self.leases.remove(pending_id)
@@ -443,7 +449,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                                 "max_minutes": spec.max_minutes,
                                 "api_identity": self.api.identity,
                                 "state": "paused-for-retest",
-                                "pod_configuration": spec.pod_configuration,
+                                "pod_configuration": pod_configuration,
                             })
                             paused = True
                     except Exception as error:

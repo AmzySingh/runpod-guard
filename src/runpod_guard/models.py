@@ -96,8 +96,8 @@ class JobSpec:
         if (self.max_cost_per_hour is not None and
                 (not math.isfinite(self.max_cost_per_hour) or self.max_cost_per_hour <= 0)):
             raise ValueError("max_cost_per_hour must be positive")
-        forbidden = {"RUNPOD_API_KEY", "RUNPOD_POD_ID", "RUNPOD_API_URL",
-                     "RUNPOD_BASE_URL"}.intersection(self.env)
+        forbidden = {"PUBLIC_KEY", "SSH_PUBLIC_KEY", "RUNPOD_API_KEY", "RUNPOD_POD_ID",
+                     "RUNPOD_API_URL", "RUNPOD_BASE_URL"}.intersection(self.env)
         if forbidden:
             raise ValueError(f"refusing to pass privileged environment variables: {sorted(forbidden)}")
 
