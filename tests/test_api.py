@@ -74,6 +74,14 @@ class APITests(unittest.TestCase):
         self.assertTrue(api.delete_and_confirm("pod", sleeper=lambda _: None))
         self.assertEqual(len(calls), 2)
 
+    def test_stop_is_confirmed_by_two_status_reads(self):
+        api = RunpodAPI("secret")
+        calls = []
+        api.stop_pod = lambda pod_id: calls.append(pod_id)
+        api.get_pod = lambda _pod_id: {"desiredStatus": "EXITED"}
+        self.assertTrue(api.stop_and_confirm("pod", sleeper=lambda _: None))
+        self.assertEqual(calls, ["pod", "pod"])
+
 
 if __name__ == "__main__":
     unittest.main()

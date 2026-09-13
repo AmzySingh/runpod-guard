@@ -51,6 +51,9 @@ class JobSpec:
     max_cost_per_hour: float | None = 1.0
     image: str = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
     container_disk_gb: int = 40
+    workspace_gb: int = 20
+    retest_window_minutes: int = 0
+    reuse_pod_id: str | None = None
     artifacts: tuple[Artifact, ...] = ()
     name: str = "job"
     env: dict[str, str] = field(default_factory=dict)
@@ -81,6 +84,13 @@ class JobSpec:
             raise ValueError("max_minutes must be between 1 and 1440")
         if not 10 <= self.container_disk_gb <= 1000:
             raise ValueError("container_disk_gb must be between 10 and 1000")
+        if not 1 <= self.workspace_gb <= 1000:
+            raise ValueError("workspace_gb must be between 1 and 1000")
+        if not 0 <= self.retest_window_minutes <= 24 * 60:
+            raise ValueError("retest_window_minutes must be between 0 and 1440")
+        if (self.reuse_pod_id is not None and
+                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", self.reuse_pod_id)):
+            raise ValueError("reuse_pod_id has an unexpected format")
         if (self.max_cost_per_hour is not None and
                 (not math.isfinite(self.max_cost_per_hour) or self.max_cost_per_hour <= 0)):
             raise ValueError("max_cost_per_hour must be positive")
@@ -103,10 +113,13 @@ class JobResult:
     terminated: bool
     elapsed_seconds: float
     cost_per_hour: float | None = None
+    paused: bool = False
+    retest_expires_at: str | None = None
 
     @property
     def ok(self) -> bool:
-        return self.returncode == 0 and not self.timed_out and self.artifacts_ok and self.terminated
+        return (self.returncode == 0 and not self.timed_out and self.artifacts_ok and
+                (self.terminated or self.paused))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -115,6 +128,8 @@ class JobResult:
             "timed_out": self.timed_out,
             "artifacts_ok": self.artifacts_ok,
             "terminated": self.terminated,
+            "paused": self.paused,
+            "retest_expires_at": self.retest_expires_at,
             "elapsed_seconds": round(self.elapsed_seconds, 2),
             "cost_per_hour": self.cost_per_hour,
             "ok": self.ok,

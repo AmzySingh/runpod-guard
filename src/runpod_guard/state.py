@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
 import json
 import os
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,21 @@ class LeaseStore:
             (self.root / f"{pod_id}.json").unlink()
         except FileNotFoundError:
             pass
+
+    @contextmanager
+    def claim(self, pod_id: str):
+        """Exclusively claim a retained Pod for the duration of one reuse attempt."""
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = self.root / f".{pod_id}.lock"
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise RuntimeError(f"Pod {pod_id} is already claimed by another retest") from error
+            yield
+        finally:
+            os.close(descriptor)
 
     def all(self) -> list[dict[str, Any]]:
         self.errors = []

@@ -1,8 +1,9 @@
 # runpod-guard
 
-Run one bounded job on a disposable Runpod GPU, retrieve its outputs, and prove the
-Pod was deleted. It is deliberately project-independent: a job is a Git repository,
-an exact revision, setup and run commands, a hardware profile, and optional outputs.
+Run one bounded job on a Runpod GPU, retrieve its outputs, and prove the Pod was
+deleted or stopped for an explicitly bounded retest window. It is deliberately
+project-independent: a job is a Git repository, an exact revision, setup and run
+commands, a hardware profile, and optional outputs.
 
 It is intended for CI jobs, model tests, short training runs and ad-hoc GPU work—not
 for an always-on inference service.
@@ -18,19 +19,22 @@ No single cleanup mechanism is trusted:
    It survives a dead SSH connection or a dead caller host.
 3. A pending lease is written before creation. The systemd timer
    reaps expired leases every five minutes after a caller crash or reboot.
-4. `max_minutes` is the caller-side target for provisioning, installation, execution
-   and artifact retrieval. Local deletion starts by that deadline. In the host-loss
-   case, the Pod watchdog deliberately has a five-minute grace before it takes over.
+4. `max_minutes` bounds provisioning, installation, execution and artifact retrieval.
+   Local teardown starts by that deadline. An explicit retest window extends only the
+   stopped-Pod lease. In the host-loss case, the Pod watchdog has a five-minute grace.
 5. `max_cost_per_hour` rejects a machine whose reported rate is over budget and
    immediately enters verified teardown.
-6. Jobs use no Pod volume or network volume. There is no storage left charging after
-   deletion, and stopped Pods are never used.
+6. Disposable jobs use no Pod volume or network volume. Retest jobs opt into a Pod
+   volume and a stopped-Pod storage charge for a bounded period.
 7. The account API key stays on the caller. It is never placed in Pod environment
    variables. The on-Pod watchdog uses Runpod's injected Pod-scoped identity.
 
 `kill -9`, sudden power loss and network partitions mean no client can make cleanup
 literally infallible. Hardened operation requires the scheduled reaper; the Pod
 watchdog is an additional fallback once SSH has been reached.
+Retest windows require the scheduled reaper because stopping a Pod also stops its
+in-container watchdog. If pausing cannot be confirmed, the caller falls back to
+verified deletion.
 Keep auto-pay disabled during initial use and enable Runpod's low-balance/stale-Pod
 notifications as the final account-level guard.
 
@@ -97,6 +101,37 @@ runpod-guard run \
   --fetch artifacts/result.json=runpod-output \
   --name model-test
 ```
+
+If a job is likely to be retested shortly, stop it for a bounded window instead of
+deleting it immediately:
+
+```bash
+runpod-guard run \
+  --repo https://github.com/ORG/PROJECT.git \
+  --ref COMMIT_SHA \
+  --command 'pytest' \
+  --max-minutes 30 \
+  --retest-window-minutes 15 \
+  --name tests
+```
+
+The result includes `paused: true`, the Pod ID, and `retest_expires_at`. Retest on
+that retained Pod by passing its ID. Omit a new window to delete it after the retest:
+
+```bash
+runpod-guard run \
+  --repo https://github.com/ORG/PROJECT.git \
+  --ref NEW_COMMIT_SHA \
+  --command 'pytest' \
+  --max-minutes 30 \
+  --reuse-pod POD_ID
+```
+
+Pass `--retest-window-minutes` again to retain it after another run. Retest jobs use
+a 20 GB Pod volume by default; adjust it with `--workspace-gb`. Runpod clears the
+container disk when a Pod stops, so only `/workspace` persists. Restarting also
+depends on GPU capacity and is not guaranteed. The reaper deletes the stopped Pod
+after the deadline; Runpod charges for its volume until deletion.
 
 For a private repository, upload a Git archive from an existing local checkout. This
 does not forward GitHub credentials and includes only files tracked at the requested

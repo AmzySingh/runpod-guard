@@ -11,6 +11,15 @@ class CLITests(unittest.TestCase):
             args = parser().parse_args(["list"])
         self.assertEqual(args.env_file, Path("/users/test/.config/runpod-guard/env"))
 
+    def test_retest_options(self):
+        args = parser().parse_args([
+            "run", "--repo", "https://example/repo", "--ref", "abc",
+            "--command", "pytest", "--retest-window-minutes", "15",
+            "--reuse-pod", "pod-1",
+        ])
+        self.assertEqual(args.retest_window_minutes, 15)
+        self.assertEqual(args.reuse_pod, "pod-1")
+
 
 if __name__ == "__main__":
     unittest.main()
