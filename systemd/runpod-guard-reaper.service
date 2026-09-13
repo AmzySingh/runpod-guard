@@ -1,0 +1,7 @@
+[Unit]
+Description=Terminate expired runpod-guard leases
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/runpod-guard/env
+ExecStart=%h/.local/bin/runpod-guard reap
