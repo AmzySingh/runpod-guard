@@ -304,7 +304,13 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
         retained_lease: dict | None = None
         if spec.reuse_pod_id:
             retained_lease = self._retained_lease(spec.reuse_pod_id)
-            if retained_lease.get("pod_configuration") != pod_configuration:
+            retained_configuration = retained_lease.get("pod_configuration")
+            legacy_configuration = {
+                key: value for key, value in pod_configuration.items()
+                if key != "ssh_public_key_sha256"
+            }
+            legacy_ssh_binding = retained_configuration == legacy_configuration
+            if retained_configuration != pod_configuration and not legacy_ssh_binding:
                 raise RuntimeError("retained Pod configuration differs from the requested job")
             pod = self.api.get_pod(spec.reuse_pod_id)
             name = str(retained_lease["name"])
@@ -316,6 +322,19 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                     if self.api.delete_and_confirm(spec.reuse_pod_id):
                         self.leases.remove(spec.reuse_pod_id)
                     raise RuntimeError("retained Pod could not be confirmed stopped before reuse")
+            if legacy_ssh_binding:
+                environment = pod.get("env")
+                if (not isinstance(environment, dict) or
+                        environment.get("PUBLIC_KEY") != public_key or
+                        environment.get("SSH_PUBLIC_KEY") != public_key):
+                    raise RuntimeError(
+                        "legacy retained Pod does not match the current SSH public key"
+                    )
+                retained_lease = {
+                    **{key: value for key, value in retained_lease.items() if key != "_path"},
+                    "pod_configuration": pod_configuration,
+                }
+                self.leases.put(spec.reuse_pod_id, retained_lease)
         else:
             name = f"rpg-{spec.name[:30]}-{uuid.uuid4().hex[:8]}"
             # Record intent before POST. If creation succeeds but its response or the
