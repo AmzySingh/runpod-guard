@@ -48,12 +48,17 @@ ln -sf "$PWD/.venv/bin/runpod-guard" ~/.local/bin/runpod-guard
 On minimal hosts without `python3-venv`, a wrapper that sets `PYTHONPATH` is also
 enough because the package has no runtime dependencies.
 
-Set the API key in the process environment or an ignored `.env` in the directory from
-which the CLI runs:
+Set the API key in the process environment or the user-wide secret file. The CLI reads
+this file by default from every working directory, so individual projects do not need
+to copy the key:
 
 ```bash
-RUNPOD_API_KEY='...'
+mkdir -p ~/.config/runpod-guard
+printf 'RUNPOD_API_KEY=%s\n' "$RUNPOD_API_KEY" > ~/.config/runpod-guard/env
+chmod 600 ~/.config/runpod-guard/env
 ```
+
+Use `--env-file /another/path` to override the shared file for a different account.
 
 The default SSH identity is `~/.ssh/runpod_engram`. Register its `.pub` file in
 Runpod account settings, then run the read-only check:

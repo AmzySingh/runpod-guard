@@ -37,7 +37,11 @@ def artifact(value: str) -> Artifact:
 
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(prog="runpod-guard")
-    command.add_argument("--env-file", type=Path, default=Path(".env"))
+    command.add_argument(
+        "--env-file", type=Path,
+        default=Path.home() / ".config" / "runpod-guard" / "env",
+        help="API-key env file (default: ~/.config/runpod-guard/env)",
+    )
     command.add_argument("--ssh-key", type=Path,
                          default=Path.home() / ".ssh" / "runpod_engram")
     subcommands = command.add_subparsers(dest="action", required=True)
