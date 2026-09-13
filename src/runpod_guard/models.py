@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import json
 import math
 from pathlib import Path, PurePosixPath
 import re
@@ -94,14 +96,46 @@ class JobSpec:
         if (self.max_cost_per_hour is not None and
                 (not math.isfinite(self.max_cost_per_hour) or self.max_cost_per_hour <= 0)):
             raise ValueError("max_cost_per_hour must be positive")
-        forbidden = {"RUNPOD_API_KEY", "RUNPOD_POD_ID", "RUNPOD_API_URL",
-                     "RUNPOD_BASE_URL"}.intersection(self.env)
+        forbidden = {"PUBLIC_KEY", "SSH_PUBLIC_KEY", "RUNPOD_API_KEY", "RUNPOD_POD_ID",
+                     "RUNPOD_API_URL", "RUNPOD_BASE_URL"}.intersection(self.env)
         if forbidden:
             raise ValueError(f"refusing to pass privileged environment variables: {sorted(forbidden)}")
 
     @property
     def selected_gpus(self) -> tuple[str, ...]:
         return self.gpu_types or GPU_PROFILES[self.profile]
+
+    @property
+    def pod_configuration(self) -> dict[str, Any]:
+        """Immutable provisioned fields that a retained Pod cannot change on restart."""
+        environment = json.dumps(self.env, sort_keys=True, separators=(",", ":")).encode()
+        return {
+            "gpu_types": list(self.selected_gpus),
+            "cloud": self.cloud,
+            "image": self.image,
+            "container_disk_gb": self.container_disk_gb,
+            "workspace_gb": self.workspace_gb,
+            # Detect a changed environment without retaining its values in local state.
+            "environment_sha256": hashlib.sha256(environment).hexdigest(),
+        }
+
+    @property
+    def receipt(self) -> dict[str, Any]:
+        """Non-secret requested configuration suitable for a result receipt."""
+        configuration = {
+            key: value for key, value in self.pod_configuration.items()
+            if key != "environment_sha256"
+        }
+        return {
+            "ref": self.ref,
+            "source": "local-archive" if self.source_dir is not None else "public-repository",
+            "profile": self.profile,
+            **configuration,
+            "max_minutes": self.max_minutes,
+            "max_cost_per_hour": self.max_cost_per_hour,
+            "retest_window_minutes": self.retest_window_minutes,
+            "reuse_requested": self.reuse_pod_id is not None,
+        }
 
 
 @dataclass(frozen=True)
@@ -115,6 +149,7 @@ class JobResult:
     cost_per_hour: float | None = None
     paused: bool = False
     retest_expires_at: str | None = None
+    requested: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -132,5 +167,6 @@ class JobResult:
             "retest_expires_at": self.retest_expires_at,
             "elapsed_seconds": round(self.elapsed_seconds, 2),
             "cost_per_hour": self.cost_per_hour,
+            "requested": self.requested,
             "ok": self.ok,
         }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
+import hashlib
 import math
 import os
 import shlex
@@ -63,8 +64,8 @@ class RunpodRunner:
             raise RuntimeError(f"SSH public key does not match private key: {path}")
         return value
 
-    def _pod_body(self, spec: JobSpec, name: str) -> dict:
-        public_key = self._public_key()
+    def _pod_body(self, spec: JobSpec, name: str, public_key: str | None = None) -> dict:
+        public_key = public_key or self._public_key()
         body = {
             "name": name,
             "imageName": spec.image,
@@ -93,6 +94,15 @@ class RunpodRunner:
             return value if math.isfinite(value) and value >= 0 else None
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _require_bounded_cost(cost: float | None, limit: float | None) -> None:
+        if limit is None:
+            return
+        if cost is None:
+            raise RuntimeError("Runpod did not report an hourly cost; refusing bounded-cost job")
+        if cost > limit:
+            raise RuntimeError(f"Pod costs ${cost:.3f}/hr, above ${limit:.3f}/hr limit")
 
     def _wait_for_address(self, pod_id: str, timeout: int = 900) -> tuple[str, int]:
         deadline = time.monotonic() + timeout
@@ -165,6 +175,7 @@ nvidia-smi -L
     @staticmethod
     def _job_script(spec: JobSpec, persistent_workspace: bool = False) -> str:
         job_root = "/workspace/runpod-guard-job" if persistent_workspace else "/root/runpod-guard-job"
+        cache_root = "/workspace/runpod-guard-cache" if persistent_workspace else "/root/runpod-guard-cache"
         if spec.source_dir is not None:
             checkout = f"""rm -rf {job_root}
 mkdir -p {job_root}
@@ -174,21 +185,20 @@ rm -f /tmp/runpod-guard-source.tar
         else:
             repo = shlex.quote(spec.repo or "")
             ref = shlex.quote(spec.ref)
-            checkout = f"""if [ -d {job_root}/.git ]; then
-  cd {job_root}
-  git remote set-url origin {repo}
-else
-  rm -rf {job_root}
-  git clone --filter=blob:none {repo} {job_root}
-fi
+            checkout = f"""rm -rf {job_root}
+mkdir -p {job_root}
+git -C {job_root} init -q
+git -C {job_root} remote add origin {repo}
 cd {job_root}
-git fetch --depth 1 origin {ref}
+git -c credential.helper= fetch --depth 1 --no-tags origin {ref}
 git checkout --detach --force FETCH_HEAD
 """
         return f"""set -euo pipefail
 {checkout}
 cd {job_root}
 mkdir -p .runpod-guard
+mkdir -p {cache_root}
+export RUNPOD_GUARD_CACHE={cache_root}
 exec > >(tee /tmp/runpod-guard-job.log) 2>&1
 trap 'cp /tmp/runpod-guard-job.log .runpod-guard/job.log 2>/dev/null || true' EXIT
 {spec.setup}
@@ -281,6 +291,11 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
     def _execute(self, spec: JobSpec) -> JobResult:
         started = time.monotonic()
         created = datetime.now(timezone.utc)
+        public_key = self._public_key()
+        pod_configuration = {
+            **spec.pod_configuration,
+            "ssh_public_key_sha256": hashlib.sha256(public_key.encode()).hexdigest(),
+        }
         # max_minutes bounds provisioning, setup, and execution. An explicit retest
         # window is recorded only after the Pod has completed and is being stopped.
         expires = created + timedelta(minutes=spec.max_minutes)
@@ -289,6 +304,8 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
         retained_lease: dict | None = None
         if spec.reuse_pod_id:
             retained_lease = self._retained_lease(spec.reuse_pod_id)
+            if retained_lease.get("pod_configuration") != pod_configuration:
+                raise RuntimeError("retained Pod configuration differs from the requested job")
             pod = self.api.get_pod(spec.reuse_pod_id)
             name = str(retained_lease["name"])
             if pod.get("name") != name:
@@ -310,7 +327,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 "api_identity": self.api.identity, "state": "creating",
             })
             try:
-                pod = self.api.create_pod(self._pod_body(spec, name))
+                pod = self.api.create_pod(self._pod_body(spec, name, public_key))
                 if not isinstance(pod, dict) or not pod.get("id"):
                     raise RunpodAPIError("Runpod create returned no Pod ID")
             except BaseException:
@@ -352,6 +369,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 "pod_id": pod_id, "name": name, "created_at": created.isoformat(),
                 "expires_at": expires.isoformat(), "max_minutes": spec.max_minutes,
                 "api_identity": self.api.identity, "state": "running",
+                "pod_configuration": pod_configuration,
             })
             if pending_id:
                 self.leases.remove(pending_id)
@@ -362,14 +380,13 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             if threading.current_thread() is threading.main_thread():
                 for signum in (signal.SIGINT, signal.SIGTERM):
                     previous_handlers[signum] = signal.signal(signum, interrupted)
-            if spec.max_cost_per_hour is not None:
-                if cost is None:
-                    raise RuntimeError("Runpod did not report an hourly cost; refusing bounded-cost job")
-                if cost > spec.max_cost_per_hour:
-                    raise RuntimeError(
-                        f"Pod costs ${cost:.3f}/hr, above ${spec.max_cost_per_hour:.3f}/hr limit"
-                    )
+            if retained_lease is None:
+                self._require_bounded_cost(cost, spec.max_cost_per_hour)
             ip, port = self._wait_for_address(pod_id, min(900, remaining()))
+            if retained_lease is not None:
+                # A stopped Pod may report only storage cost. Check refreshed running cost.
+                cost = self._cost(self.api.get_pod(pod_id))
+                self._require_bounded_cost(cost, spec.max_cost_per_hour)
             self._wait_for_ssh(ip, port, min(300, remaining()))
             # Five minutes beyond the local deadline is enough for ordinary local
             # teardown, but still bounds spend if this process or host disappears.
@@ -432,6 +449,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                                 "max_minutes": spec.max_minutes,
                                 "api_identity": self.api.identity,
                                 "state": "paused-for-retest",
+                                "pod_configuration": pod_configuration,
                             })
                             paused = True
                     except Exception as error:
@@ -489,6 +507,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             artifacts_ok=artifacts_ok, terminated=terminated,
             elapsed_seconds=time.monotonic() - started, cost_per_hour=cost,
             paused=paused, retest_expires_at=retest_expires_at,
+            requested=spec.receipt,
         )
 
     def reap(self, all_managed: bool = False) -> list[str]:
