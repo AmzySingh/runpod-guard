@@ -93,6 +93,19 @@ runpod-guard run \
   --name model-test
 ```
 
+For a private repository, upload a Git archive from an existing local checkout. This
+does not forward GitHub credentials and includes only files tracked at the requested
+revision, so ignored files such as `.env` are not copied:
+
+```bash
+runpod-guard run \
+  --source /path/to/private-project \
+  --ref COMMIT_SHA \
+  --profile small \
+  --max-minutes 45 \
+  --command 'python -m project.model_test'
+```
+
 Profiles are ordered availability fallbacks:
 
 | Profile | Intended size | Default GPU choices |
@@ -158,8 +171,8 @@ primary teardown paths.
 
 ## Current limitations
 
-- Git cloning assumes a public repository. Private-repository credentials are not
-  forwarded implicitly; add a narrowly scoped mechanism deliberately.
+- Remote Git cloning assumes a public repository. Private repositories can use
+  `--source`; credentials and untracked or ignored files are never uploaded.
 - Repository setup and job commands run as root and are intentionally arbitrary.
   Treat the selected repository and exact revision as trusted code.
 - Artifacts are copied with SCP before deletion and each transfer has a two-minute

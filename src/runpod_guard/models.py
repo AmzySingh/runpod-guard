@@ -39,10 +39,11 @@ class Artifact:
 
 @dataclass(frozen=True)
 class JobSpec:
-    repo: str
+    repo: str | None
     ref: str
     command: str
     setup: str = ""
+    source_dir: Path | None = None
     profile: str = "small"
     gpu_types: tuple[str, ...] = ()
     cloud: str = "SECURE"
@@ -55,13 +56,20 @@ class JobSpec:
     env: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.repo or not self.ref or not self.command:
-            raise ValueError("repo, ref and command are required")
-        parsed_repo = urlsplit(self.repo)
-        if (parsed_repo.scheme != "https" or not parsed_repo.hostname or
-                parsed_repo.username or parsed_repo.password or parsed_repo.query or
-                parsed_repo.fragment):
-            raise ValueError("repo must be a public HTTPS URL without embedded credentials")
+        if not self.ref or not self.command:
+            raise ValueError("ref and command are required")
+        if bool(self.repo) == bool(self.source_dir):
+            raise ValueError("exactly one of repo or source_dir is required")
+        if self.repo:
+            parsed_repo = urlsplit(self.repo)
+            if (parsed_repo.scheme != "https" or not parsed_repo.hostname or
+                    parsed_repo.username or parsed_repo.password or parsed_repo.query or
+                    parsed_repo.fragment):
+                raise ValueError("repo must be a public HTTPS URL without embedded credentials")
+        if self.source_dir is not None:
+            source = self.source_dir.expanduser()
+            if not source.is_dir() or not (source / ".git").exists():
+                raise ValueError("source_dir must be a local Git working tree")
         if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", self.ref) or
                 ".." in self.ref or "@{" in self.ref):
             raise ValueError("ref contains syntax Git could interpret unsafely")

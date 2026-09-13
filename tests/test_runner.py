@@ -67,6 +67,45 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("nvidia-smi -L", scripts[1])
             self.assertIn("git checkout --detach FETCH_HEAD", scripts[2])
 
+    def test_local_source_is_archived_uploaded_and_extracted(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "source"
+            source.mkdir()
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
+            (source / "tracked.txt").write_text("tracked\n")
+            (source / ".env").write_text("SECRET=not-uploaded\n")
+            subprocess.run(["git", "-C", str(source), "add", "tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-qm", "fixture"], check=True)
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            scripts = []
+            archives = []
+
+            def ssh(_ip, _port, script, _timeout):
+                scripts.append(script)
+                return 0
+
+            def upload(_ip, _port, archive, _timeout):
+                listing = subprocess.run(["tar", "-tf", str(archive)], check=True,
+                                         text=True, stdout=subprocess.PIPE).stdout.splitlines()
+                archives.extend(listing)
+                return True
+
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), \
+                 patch.object(runner, "_ssh", side_effect=ssh), \
+                 patch.object(runner, "_upload_source", side_effect=upload):
+                result = runner.execute(JobSpec(
+                    repo=None, source_dir=source, ref="HEAD", command="true",
+                    max_minutes=10, max_cost_per_hour=0.5,
+                ))
+            self.assertTrue(result.ok)
+            self.assertIn("tracked.txt", archives)
+            self.assertNotIn(".env", archives)
+            self.assertIn("tar -xf /tmp/runpod-guard-source.tar", scripts[2])
+
     def test_over_budget_still_deletes(self):
         with tempfile.TemporaryDirectory() as root:
             api = FakeAPI()

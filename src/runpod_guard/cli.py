@@ -49,7 +49,10 @@ def parser() -> argparse.ArgumentParser:
                       help="delete every Pod whose name starts rpg-, even before its deadline")
 
     run = subcommands.add_parser("run", help="run one bounded disposable job")
-    run.add_argument("--repo", required=True)
+    source = run.add_mutually_exclusive_group(required=True)
+    source.add_argument("--repo", help="public HTTPS Git repository")
+    source.add_argument("--source", type=Path,
+                        help="local Git tree; uploads only files tracked at --ref")
     run.add_argument("--ref", required=True, help="commit SHA, tag, or branch")
     run.add_argument("--command", required=True, help="shell command inside the checkout")
     run.add_argument("--setup", default="", help="shell setup command before the job")
@@ -85,7 +88,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"removed": removed, "failures": runner.reap_failures}))
         return 1 if runner.reap_failures else 0
     spec = JobSpec(
-        repo=args.repo, ref=args.ref, command=args.command, setup=args.setup,
+        repo=args.repo, source_dir=args.source, ref=args.ref,
+        command=args.command, setup=args.setup,
         profile=args.profile, gpu_types=tuple(args.gpu), cloud=args.cloud,
         max_minutes=args.max_minutes, max_cost_per_hour=args.max_cost_per_hour,
         image=args.image, container_disk_gb=args.disk_gb,

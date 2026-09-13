@@ -5,6 +5,7 @@ import math
 import shlex
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -151,6 +152,7 @@ class RunpodRunner:
     def _bootstrap_script() -> str:
         return """set -eu
 command -v git
+command -v tar
 command -v runpodctl
 command -v nvidia-smi
 nvidia-smi -L
@@ -158,14 +160,23 @@ nvidia-smi -L
 
     @staticmethod
     def _job_script(spec: JobSpec) -> str:
-        repo = shlex.quote(spec.repo)
-        ref = shlex.quote(spec.ref)
-        return f"""set -euo pipefail
-rm -rf /root/runpod-guard-job
-git clone --filter=blob:none {repo} /root/runpod-guard-job
+        if spec.source_dir is not None:
+            checkout = """mkdir -p /root/runpod-guard-job
+tar -xf /tmp/runpod-guard-source.tar -C /root/runpod-guard-job
+rm -f /tmp/runpod-guard-source.tar
+"""
+        else:
+            repo = shlex.quote(spec.repo or "")
+            ref = shlex.quote(spec.ref)
+            checkout = f"""git clone --filter=blob:none {repo} /root/runpod-guard-job
 cd /root/runpod-guard-job
 git fetch --depth 1 origin {ref}
 git checkout --detach FETCH_HEAD
+"""
+        return f"""set -euo pipefail
+rm -rf /root/runpod-guard-job
+{checkout}
+cd /root/runpod-guard-job
 mkdir -p .runpod-guard
 exec > >(tee /tmp/runpod-guard-job.log) 2>&1
 trap 'cp /tmp/runpod-guard-job.log .runpod-guard/job.log 2>/dev/null || true' EXIT
@@ -176,6 +187,38 @@ job_status=$?
 set -e
 exit "$job_status"
 """
+
+    @staticmethod
+    def _source_archive(spec: JobSpec) -> Path:
+        if spec.source_dir is None:
+            raise ValueError("source_dir is required")
+        source = spec.source_dir.expanduser().resolve()
+        handle = tempfile.NamedTemporaryFile(prefix="runpod-guard-", suffix=".tar", delete=False)
+        archive = Path(handle.name)
+        handle.close()
+        try:
+            subprocess.run(
+                ["git", "-C", str(source), "archive", "--format=tar",
+                 f"--output={archive}", spec.ref],
+                check=True, stdin=subprocess.DEVNULL, timeout=120,
+            )
+            archive.chmod(0o600)
+            return archive
+        except BaseException:
+            archive.unlink(missing_ok=True)
+            raise
+
+    def _upload_source(self, ip: str, port: int, archive: Path, timeout: int) -> bool:
+        command = [
+            "scp", "-P", str(port), "-i", str(self.ssh_key),
+            "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
+            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+            str(archive), f"root@{ip}:/tmp/runpod-guard-source.tar",
+        ]
+        try:
+            return subprocess.run(command, timeout=timeout).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
 
     def _fetch(self, ip: str, port: int, artifact: Artifact, timeout: int = 120) -> bool:
         local_dir = artifact.local_dir.expanduser().resolve()
@@ -278,6 +321,13 @@ case "$candidate" in /root/runpod-guard-job/*) exit 0;; *) exit 1;; esac
             self._log("independent on-Pod watchdog armed")
             if self._ssh(ip, port, self._bootstrap_script(), min(60, remaining())) != 0:
                 raise RuntimeError("Pod is missing git, runpodctl, or a visible NVIDIA GPU")
+            if spec.source_dir is not None:
+                archive = self._source_archive(spec)
+                try:
+                    if not self._upload_source(ip, port, archive, min(120, remaining())):
+                        raise RuntimeError("could not upload the local source archive")
+                finally:
+                    archive.unlink(missing_ok=True)
             try:
                 reserve = min(120, max(30, spec.max_minutes * 6))
                 job_budget = remaining() - reserve
