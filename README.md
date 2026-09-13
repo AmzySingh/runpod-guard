@@ -68,7 +68,7 @@ An infrastructure-only smoke test against this public repository:
 
 ```bash
 runpod-guard run \
-  --repo https://github.com/OWNER/runpod-guard.git \
+  --repo https://github.com/AmzySingh/runpod-guard.git \
   --ref COMMIT_SHA \
   --profile small \
   --cloud COMMUNITY \
