@@ -148,6 +148,8 @@ allocates a fresh Pod using the requested GPU fallback list. It does not retry s
 the job command, model output, artifact retrieval, permanent API errors, or timeouts.
 Fallback happens only after the retained Pod is confirmed stopped, and time spent on
 start attempts is deducted from the original job deadline.
+The final receipt keeps the original request and total elapsed time, and records the
+effective fresh-Pod budget plus whether the retained Pod was preserved at fallback.
 The reaper deletes the stopped Pod after the deadline; Runpod
 charges for its volume until deletion.
 

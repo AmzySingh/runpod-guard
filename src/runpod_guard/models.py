@@ -160,6 +160,9 @@ class JobResult:
     paused: bool = False
     retest_expires_at: str | None = None
     requested: dict[str, Any] = field(default_factory=dict)
+    fresh_fallback_used: bool = False
+    fresh_fallback_max_minutes: int | None = None
+    retained_pod_preserved_at_fallback: bool = False
 
     @property
     def ok(self) -> bool:
@@ -178,5 +181,8 @@ class JobResult:
             "elapsed_seconds": round(self.elapsed_seconds, 2),
             "cost_per_hour": self.cost_per_hour,
             "requested": self.requested,
+            "fresh_fallback_used": self.fresh_fallback_used,
+            "fresh_fallback_max_minutes": self.fresh_fallback_max_minutes,
+            "retained_pod_preserved_at_fallback": self.retained_pod_preserved_at_fallback,
             "ok": self.ok,
         }

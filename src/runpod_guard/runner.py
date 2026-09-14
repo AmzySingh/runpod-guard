@@ -335,9 +335,17 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             if fallback_minutes < 1:
                 raise TimeoutError("no job budget remains for a fresh fallback")
             self._log("retained Pod remained unavailable; allocating a fresh fallback")
-            return self._execute(replace(
+            fresh = self._execute(replace(
                 spec, reuse_pod_id=None, max_minutes=fallback_minutes
             ))
+            return replace(
+                fresh,
+                elapsed_seconds=time.monotonic() - started,
+                requested=spec.receipt,
+                fresh_fallback_used=True,
+                fresh_fallback_max_minutes=fallback_minutes,
+                retained_pod_preserved_at_fallback=True,
+            )
         return self._execute(spec)
 
     def _start_retained_pod(self, pod_id: str, spec: JobSpec,
