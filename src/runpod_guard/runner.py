@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import math
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -281,6 +282,32 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 return lease
             break
         raise RuntimeError(f"{pod_id} is not an unexpired Pod retained by this API identity")
+
+    def extend_retest(self, pod_id: str, minutes: int) -> str:
+        """Renew a stopped, guard-owned Pod lease without starting its GPU."""
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", pod_id):
+            raise ValueError("pod_id has an unexpected format")
+        if not 1 <= minutes <= 24 * 60:
+            raise ValueError("minutes must be between 1 and 1440")
+        with self.leases.claim(pod_id):
+            lease = next((row for row in self.leases.all()
+                          if row.get("pod_id") == pod_id), None)
+            if (lease is None or lease.get("api_identity") != self.api.identity or
+                    lease.get("state") != "paused-for-retest"):
+                raise RuntimeError(
+                    f"{pod_id} is not a stopped Pod retained by this API identity"
+                )
+            pod = self.api.get_pod(pod_id)
+            if pod.get("name") != lease.get("name"):
+                raise RuntimeError("retained Pod name no longer matches its local lease")
+            status = pod.get("desiredStatus") or pod.get("status")
+            if status not in {"EXITED", "STOPPED"}:
+                raise RuntimeError("retained Pod is not stopped; refusing to extend its lease")
+            expires = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+            renewed = {key: value for key, value in lease.items() if key != "_path"}
+            renewed["expires_at"] = expires.isoformat()
+            self.leases.put(pod_id, renewed)
+            return expires.isoformat()
 
     def execute(self, spec: JobSpec) -> JobResult:
         if spec.reuse_pod_id:

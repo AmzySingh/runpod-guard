@@ -22,6 +22,12 @@ class CLITests(unittest.TestCase):
         self.assertEqual(args.reuse_start_attempts, 4)
         self.assertEqual(args.reuse_start_delay_seconds, 20)
 
+    def test_extend_options(self):
+        args = parser().parse_args(["extend", "pod-1", "--minutes", "1440"])
+        self.assertEqual(args.action, "extend")
+        self.assertEqual(args.pod_id, "pod-1")
+        self.assertEqual(args.minutes, 1440)
+
 
 if __name__ == "__main__":
     unittest.main()
