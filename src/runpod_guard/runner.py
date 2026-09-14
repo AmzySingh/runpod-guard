@@ -291,10 +291,24 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
     def _start_retained_pod(self, pod_id: str, spec: JobSpec,
                             remaining: Callable[[], int]) -> None:
         for attempt in range(1, spec.reuse_start_attempts + 1):
+            # A previous delay may have consumed the rest of the job budget.
+            remaining()
             try:
                 self.api.start_pod(pod_id)
                 return
             except RunpodAPIError as error:
+                # POST can succeed at Runpod even when its response is lost. Reconcile
+                # provider state before deciding whether to retry or fail.
+                try:
+                    pod = self.api.get_pod(pod_id)
+                except RunpodAPIError as status_error:
+                    if not status_error.retryable:
+                        raise status_error from error
+                else:
+                    status = pod.get("desiredStatus") or pod.get("status")
+                    if status == "RUNNING":
+                        self._log("retained Pod start was confirmed after a failed response")
+                        return
                 if not error.retryable or attempt == spec.reuse_start_attempts:
                     raise
                 delay = min(spec.reuse_start_delay_seconds, remaining())
@@ -400,6 +414,9 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             return seconds
 
         try:
+            if threading.current_thread() is threading.main_thread():
+                for signum in (signal.SIGINT, signal.SIGTERM):
+                    previous_handlers[signum] = signal.signal(signum, interrupted)
             self.leases.put(pod_id, {
                 "pod_id": pod_id, "name": name, "created_at": created.isoformat(),
                 "expires_at": expires.isoformat(), "max_minutes": spec.max_minutes,
@@ -412,9 +429,6 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             else:
                 self._start_retained_pod(pod_id, spec, remaining)
                 self._log(f"restarting retained Pod {pod_id}; hard deadline {expires.isoformat()}")
-            if threading.current_thread() is threading.main_thread():
-                for signum in (signal.SIGINT, signal.SIGTERM):
-                    previous_handlers[signum] = signal.signal(signum, interrupted)
             if retained_lease is None:
                 self._require_bounded_cost(cost, spec.max_cost_per_hour)
             ip, port = self._wait_for_address(pod_id, min(900, remaining()))

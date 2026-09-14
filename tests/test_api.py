@@ -48,6 +48,8 @@ class APITests(unittest.TestCase):
     def test_server_and_network_errors_are_retryable(self):
         self.assertTrue(RunpodAPIError("server", 500).retryable)
         self.assertTrue(RunpodAPIError("network").retryable)
+        self.assertTrue(RunpodAPIError("request timeout", 408).retryable)
+        self.assertTrue(RunpodAPIError("rate limited", 429).retryable)
         self.assertFalse(RunpodAPIError("bad request", 400).retryable)
 
     def test_delete_is_confirmed_by_listing(self):
