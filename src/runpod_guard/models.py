@@ -65,6 +65,7 @@ class JobSpec:
     # Kept after the original fields so adding ordered reuse does not shift the
     # positional Python API. New callers should pass it by keyword.
     reuse_pod_ids: tuple[str, ...] = ()
+    gpu_priority: str = "custom"
 
     def __post_init__(self) -> None:
         if not self.ref or not self.command:
@@ -86,6 +87,8 @@ class JobSpec:
             raise ValueError("ref contains syntax Git could interpret unsafely")
         if self.profile not in GPU_PROFILES:
             raise ValueError(f"unknown profile {self.profile!r}; choose {', '.join(GPU_PROFILES)}")
+        if self.gpu_priority not in {"custom", "availability"}:
+            raise ValueError("gpu_priority must be custom or availability")
         if self.cloud not in {"COMMUNITY", "SECURE"}:
             raise ValueError("cloud must be COMMUNITY or SECURE")
         if not 1 <= self.max_minutes <= 24 * 60:
@@ -150,6 +153,7 @@ class JobSpec:
             "source": "local-archive" if self.source_dir is not None else "public-repository",
             "profile": self.profile,
             **configuration,
+            "gpu_priority": self.gpu_priority,
             "max_minutes": self.max_minutes,
             "max_cost_per_hour": self.max_cost_per_hour,
             "retest_window_minutes": self.retest_window_minutes,

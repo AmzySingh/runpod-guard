@@ -197,6 +197,11 @@ Profiles are ordered availability fallbacks:
 | `xlarge` | 80 GB | A100 PCIe, A100 SXM |
 
 Use repeated `--gpu` flags to replace a profile with exact Runpod GPU IDs.
+The default `--gpu-priority custom` asks Runpod to follow that list in order.
+Use `--gpu-priority availability` to let Runpod choose from the same compatible list
+based on current capacity. The choice is recorded in receipts and treated as part of
+the fresh allocation request. It does not affect or restrict an already-created
+retained Pod, so it can be changed when fresh fallback is enabled.
 
 Operational commands:
 

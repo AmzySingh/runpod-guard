@@ -69,6 +69,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--setup", default="", help="shell setup command before the job")
     run.add_argument("--profile", choices=GPU_PROFILES, default="small")
     run.add_argument("--gpu", action="append", default=[], help="exact GPU id; repeat for fallbacks")
+    run.add_argument("--gpu-priority", choices=["custom", "availability"], default="custom",
+                     help="use GPU list order or current availability (default: custom)")
     run.add_argument("--cloud", choices=["COMMUNITY", "SECURE"], default="SECURE")
     run.add_argument("--max-minutes", type=int, default=60)
     run.add_argument("--max-cost-per-hour", type=float, default=1.0,
@@ -117,7 +119,8 @@ def main(argv: list[str] | None = None) -> int:
     spec = JobSpec(
         repo=args.repo, source_dir=args.source, ref=args.ref,
         command=args.command, setup=args.setup,
-        profile=args.profile, gpu_types=tuple(args.gpu), cloud=args.cloud,
+        profile=args.profile, gpu_types=tuple(args.gpu), gpu_priority=args.gpu_priority,
+        cloud=args.cloud,
         max_minutes=args.max_minutes, max_cost_per_hour=args.max_cost_per_hour,
         image=args.image, container_disk_gb=args.disk_gb,
         workspace_gb=args.workspace_gb,

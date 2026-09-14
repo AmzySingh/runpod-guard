@@ -78,6 +78,7 @@ class RunnerTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertEqual(api.deleted, ["pod-1"])
             self.assertEqual(api.body["volumeInGb"], 0)
+            self.assertEqual(api.body["gpuTypePriority"], "custom")
             self.assertNotIn("RUNPOD_API_KEY", api.body["env"])
             self.assertIn("PUBLIC_KEY", api.body["env"])
             self.assertIn("runpodctl pod delete", scripts[0])
@@ -88,6 +89,20 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("RUNPOD_GUARD_CACHE=/root/runpod-guard-cache", scripts[2])
             self.assertNotIn("RUNPOD_GUARD_CACHE=/workspace/runpod-guard-cache", scripts[2])
             self.assertNotIn("--filter", scripts[2])
+
+    def test_availability_gpu_priority_is_sent_to_runpod(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="true",
+                    gpu_priority="availability",
+                ))
+            self.assertTrue(result.ok)
+            self.assertEqual("availability", api.body["gpuTypePriority"])
+            self.assertEqual("availability", result.requested["gpu_priority"])
 
     def test_completed_job_can_pause_for_bounded_retest_and_be_reused(self):
         with tempfile.TemporaryDirectory() as root:
@@ -470,7 +485,8 @@ class RunnerTests(unittest.TestCase):
                  patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
                 result = runner.execute(JobSpec(
                     repo="https://example/repo", ref="def", command="pytest",
-                    max_minutes=10, reuse_pod_id="pod-1", reuse_start_attempts=2,
+                    max_minutes=10, reuse_pod_ids=("pod-1",), reuse_start_attempts=2,
+                    gpu_priority="availability",
                     fallback_fresh_on_reuse_unavailable=True,
                 ))
 
@@ -488,6 +504,8 @@ class RunnerTests(unittest.TestCase):
             self.assertTrue(encoded["retained_pod_preserved_at_fallback"])
             self.assertEqual(["unavailable-preserved"], encoded["reuse_candidate_dispositions"])
             self.assertEqual([20], [call.args[0] for call in sleep.call_args_list])
+            self.assertEqual("availability", api.body["gpuTypePriority"])
+            self.assertEqual("availability", result.requested["gpu_priority"])
             self.assertEqual(["pod-2"], api.deleted)
             retained = runner.leases.all()[0]
             self.assertEqual("pod-1", retained["pod_id"])

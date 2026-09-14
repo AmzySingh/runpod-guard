@@ -13,6 +13,8 @@ class ModelTests(unittest.TestCase):
         self.assertNotIn("command", spec.receipt)
         self.assertNotIn("environment_sha256", spec.receipt)
         self.assertEqual(spec.receipt["cloud"], "SECURE")
+        self.assertNotIn("gpu_priority", spec.pod_configuration)
+        self.assertEqual(spec.receipt["gpu_priority"], "custom")
         self.assertFalse(spec.receipt["reuse_requested"])
         self.assertEqual(spec.receipt["reuse_candidate_count"], 0)
         self.assertFalse(spec.receipt["fallback_fresh_on_reuse_unavailable"])
@@ -32,6 +34,9 @@ class ModelTests(unittest.TestCase):
             Artifact("out/result;touch-pwned")
         with self.assertRaises(ValueError):
             JobSpec(repo="https://example/repo", ref="y", command="z", max_minutes=0)
+        with self.assertRaises(ValueError):
+            JobSpec(repo="https://example/repo", ref="y", command="z",
+                    gpu_priority="cheapest")
         with self.assertRaises(ValueError):
             JobSpec(repo="https://example/repo", ref="y", command="z",
                     retest_window_minutes=1441)

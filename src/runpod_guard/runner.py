@@ -76,7 +76,7 @@ class RunpodRunner:
             "name": name,
             "imageName": spec.image,
             "gpuTypeIds": list(spec.selected_gpus),
-            "gpuTypePriority": "custom",
+            "gpuTypePriority": spec.gpu_priority,
             "cloudType": spec.cloud,
             "gpuCount": 1,
             "containerDiskInGb": spec.container_disk_gb,
