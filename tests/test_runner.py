@@ -83,6 +83,9 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("while true", scripts[0])
             self.assertIn("nvidia-smi -L", scripts[1])
             self.assertIn("git checkout --detach --force FETCH_HEAD", scripts[2])
+            self.assertIn("/root/runpod-guard-job", scripts[2])
+            self.assertIn("RUNPOD_GUARD_CACHE=/root/runpod-guard-cache", scripts[2])
+            self.assertNotIn("RUNPOD_GUARD_CACHE=/workspace/runpod-guard-cache", scripts[2])
             self.assertNotIn("--filter", scripts[2])
 
     def test_completed_job_can_pause_for_bounded_retest_and_be_reused(self):

@@ -131,7 +131,10 @@ Pass `--retest-window-minutes` again to retain it after another run. Retest jobs
 a 20 GB Pod volume by default; adjust it with `--workspace-gb`. Runpod clears the
 container disk when a Pod stops, so only `/workspace` persists. Every invocation gets
 a fresh checkout at `/workspace/runpod-guard-job`; put reusable downloads and build
-outputs under the exported `RUNPOD_GUARD_CACHE` path instead. The runner binds a
+outputs under the exported `RUNPOD_GUARD_CACHE` path instead. For a retained or reused
+Pod this is `/workspace/runpod-guard-cache`. For a non-retained run it is the ephemeral
+`/root/runpod-guard-cache`, which is deleted with the Pod and must not be treated as
+persistent. The runner binds a
 retained Pod to its original GPU choices, cloud, image, disk sizes and environment;
 repeat those options unchanged on reuse. Restarting also depends on GPU capacity and
 is not guaranteed. The reaper deletes the stopped Pod after the deadline; Runpod
