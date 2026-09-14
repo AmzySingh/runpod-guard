@@ -14,7 +14,16 @@ class ModelTests(unittest.TestCase):
         self.assertNotIn("environment_sha256", spec.receipt)
         self.assertEqual(spec.receipt["cloud"], "SECURE")
         self.assertFalse(spec.receipt["reuse_requested"])
+        self.assertEqual(spec.receipt["reuse_candidate_count"], 0)
         self.assertFalse(spec.receipt["fallback_fresh_on_reuse_unavailable"])
+
+        ordered = JobSpec(
+            repo="https://example/repo", ref="abc", command="true",
+            reuse_pod_ids=("candidate-a", "candidate-b"),
+        )
+        self.assertEqual(ordered.retained_pod_ids, ("candidate-a", "candidate-b"))
+        self.assertEqual(ordered.receipt["reuse_candidate_count"], 2)
+        self.assertNotIn("candidate-a", str(ordered.receipt))
 
     def test_rejects_unsafe_values(self):
         with self.assertRaises(ValueError):
@@ -28,6 +37,15 @@ class ModelTests(unittest.TestCase):
                     retest_window_minutes=1441)
         with self.assertRaises(ValueError):
             JobSpec(repo="https://example/repo", ref="y", command="z", reuse_pod_id="bad/id")
+        with self.assertRaises(ValueError):
+            JobSpec(repo="https://example/repo", ref="y", command="z",
+                    reuse_pod_ids=("valid", "bad/id"))
+        with self.assertRaises(ValueError):
+            JobSpec(repo="https://example/repo", ref="y", command="z",
+                    reuse_pod_ids=("same", "same"))
+        with self.assertRaises(ValueError):
+            JobSpec(repo="https://example/repo", ref="y", command="z",
+                    reuse_pod_id="one", reuse_pod_ids=("two",))
         with self.assertRaises(ValueError):
             JobSpec(repo="https://example/repo", ref="y", command="z", reuse_start_attempts=0)
         with self.assertRaises(ValueError):

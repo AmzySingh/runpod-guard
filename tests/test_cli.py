@@ -16,10 +16,11 @@ class CLITests(unittest.TestCase):
             "run", "--repo", "https://example/repo", "--ref", "abc",
             "--command", "pytest", "--retest-window-minutes", "15",
             "--reuse-pod", "pod-1",
+            "--reuse-pod", "pod-2",
             "--fallback-fresh-on-reuse-unavailable",
         ])
         self.assertEqual(args.retest_window_minutes, 15)
-        self.assertEqual(args.reuse_pod, "pod-1")
+        self.assertEqual(args.reuse_pod, ["pod-1", "pod-2"])
         self.assertEqual(args.reuse_start_attempts, 4)
         self.assertEqual(args.reuse_start_delay_seconds, 20)
         self.assertTrue(args.fallback_fresh_on_reuse_unavailable)

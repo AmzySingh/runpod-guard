@@ -62,6 +62,9 @@ class JobSpec:
     artifacts: tuple[Artifact, ...] = ()
     name: str = "job"
     env: dict[str, str] = field(default_factory=dict)
+    # Kept after the original fields so adding ordered reuse does not shift the
+    # positional Python API. New callers should pass it by keyword.
+    reuse_pod_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.ref or not self.command:
@@ -93,9 +96,13 @@ class JobSpec:
             raise ValueError("workspace_gb must be between 1 and 1000")
         if not 0 <= self.retest_window_minutes <= 24 * 60:
             raise ValueError("retest_window_minutes must be between 0 and 1440")
-        if (self.reuse_pod_id is not None and
-                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", self.reuse_pod_id)):
-            raise ValueError("reuse_pod_id has an unexpected format")
+        if self.reuse_pod_id is not None and self.reuse_pod_ids:
+            raise ValueError("use reuse_pod_id or reuse_pod_ids, not both")
+        for pod_id in self.retained_pod_ids:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", pod_id):
+                raise ValueError("retained Pod ID has an unexpected format")
+        if len(set(self.retained_pod_ids)) != len(self.retained_pod_ids):
+            raise ValueError("retained Pod IDs must be unique")
         if not 1 <= self.reuse_start_attempts <= 10:
             raise ValueError("reuse_start_attempts must be between 1 and 10")
         if not 1 <= self.reuse_start_delay_seconds <= 300:
@@ -111,6 +118,11 @@ class JobSpec:
     @property
     def selected_gpus(self) -> tuple[str, ...]:
         return self.gpu_types or GPU_PROFILES[self.profile]
+
+    @property
+    def retained_pod_ids(self) -> tuple[str, ...]:
+        """Explicit retained Pods to try, preserving the caller's order."""
+        return self.reuse_pod_ids or ((self.reuse_pod_id,) if self.reuse_pod_id else ())
 
     @property
     def pod_configuration(self) -> dict[str, Any]:
@@ -141,7 +153,8 @@ class JobSpec:
             "max_minutes": self.max_minutes,
             "max_cost_per_hour": self.max_cost_per_hour,
             "retest_window_minutes": self.retest_window_minutes,
-            "reuse_requested": self.reuse_pod_id is not None,
+            "reuse_requested": bool(self.retained_pod_ids),
+            "reuse_candidate_count": len(self.retained_pod_ids),
             "reuse_start_attempts": self.reuse_start_attempts,
             "reuse_start_delay_seconds": self.reuse_start_delay_seconds,
             "fallback_fresh_on_reuse_unavailable": self.fallback_fresh_on_reuse_unavailable,
@@ -163,6 +176,7 @@ class JobResult:
     fresh_fallback_used: bool = False
     fresh_fallback_max_minutes: int | None = None
     retained_pod_preserved_at_fallback: bool = False
+    reuse_candidate_dispositions: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -184,5 +198,6 @@ class JobResult:
             "fresh_fallback_used": self.fresh_fallback_used,
             "fresh_fallback_max_minutes": self.fresh_fallback_max_minutes,
             "retained_pod_preserved_at_fallback": self.retained_pod_preserved_at_fallback,
+            "reuse_candidate_dispositions": list(self.reuse_candidate_dispositions),
             "ok": self.ok,
         }

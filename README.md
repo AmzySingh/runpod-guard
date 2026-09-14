@@ -124,13 +124,22 @@ runpod-guard run \
   --ref NEW_COMMIT_SHA \
   --command 'pytest' \
   --max-minutes 30 \
-  --reuse-pod POD_ID \
+  --reuse-pod FIRST_POD_ID \
+  --reuse-pod SECOND_POD_ID \
   --reuse-start-attempts 4 \
   --reuse-start-delay-seconds 20 \
   --fallback-fresh-on-reuse-unavailable
 ```
 
-Pass `--retest-window-minutes` again to retain it after another run. Retest jobs use
+Repeat `--reuse-pod` to try an explicit ordered list of compatible retained Pods.
+The runner advances only when a candidate exhausts its temporary start retries and
+is confirmed stopped with its lease restored. Ownership, configuration, permanent
+API, cleanup, and timeout failures stop the run. All candidates share the original
+`max_minutes` deadline. Fresh allocation remains separately opt-in and happens only
+after every candidate is unavailable. Receipts report the candidate count and safe
+dispositions without copying Pod IDs into the requested configuration.
+
+Pass `--retest-window-minutes` again to retain the Pod that ran the job. Retest jobs use
 a 20 GB Pod volume by default; adjust it with `--workspace-gb`. Runpod clears the
 container disk when a Pod stops, so only `/workspace` persists. Every invocation gets
 a fresh checkout. For a retained or reused Pod, the checkout is
@@ -149,7 +158,7 @@ the job command, model output, artifact retrieval, permanent API errors, or time
 Fallback happens only after the retained Pod is confirmed stopped, and time spent on
 start attempts is deducted from the original job deadline.
 The final receipt keeps the original request and total elapsed time, and records the
-effective fresh-Pod budget plus whether the retained Pod was preserved at fallback.
+effective fresh-Pod budget plus whether the retained candidates were preserved.
 The reaper deletes the stopped Pod after the deadline; Runpod
 charges for its volume until deletion.
 

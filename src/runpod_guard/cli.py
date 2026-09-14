@@ -79,7 +79,8 @@ def parser() -> argparse.ArgumentParser:
                      help="persistent workspace size when retaining for a retest (default: 20)")
     run.add_argument("--retest-window-minutes", type=int, default=0,
                      help="stop instead of delete after a completed job; reaper deletes at expiry")
-    run.add_argument("--reuse-pod", help="restart a Pod retained by an earlier guarded run")
+    run.add_argument("--reuse-pod", action="append", default=[],
+                     help="retained Pod to try; repeat for an ordered candidate list")
     run.add_argument("--reuse-start-attempts", type=int, default=4,
                      help="start attempts for a retained Pod (default: 4)")
     run.add_argument("--reuse-start-delay-seconds", type=int, default=20,
@@ -121,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
         image=args.image, container_disk_gb=args.disk_gb,
         workspace_gb=args.workspace_gb,
         retest_window_minutes=args.retest_window_minutes,
-        reuse_pod_id=args.reuse_pod,
+        reuse_pod_ids=tuple(args.reuse_pod),
         reuse_start_attempts=args.reuse_start_attempts,
         reuse_start_delay_seconds=args.reuse_start_delay_seconds,
         fallback_fresh_on_reuse_unavailable=args.fallback_fresh_on_reuse_unavailable,

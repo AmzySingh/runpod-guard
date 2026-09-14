@@ -315,29 +315,49 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             return expires.isoformat()
 
     def execute(self, spec: JobSpec) -> JobResult:
-        if spec.reuse_pod_id:
+        candidates = spec.retained_pod_ids
+        if candidates:
             started = time.monotonic()
-            with self.leases.claim(spec.reuse_pod_id):
-                try:
-                    return self._execute(spec)
-                except RetainedPodUnavailable as error:
-                    if not spec.fallback_fresh_on_reuse_unavailable:
-                        raise
-                    leases = [lease for lease in self.leases.all()
-                              if lease.get("pod_id") == spec.reuse_pod_id]
-                    if len(leases) != 1 or leases[0].get("state") != "paused-for-retest":
-                        raise RuntimeError(
-                            "retained Pod was unavailable but was not confirmed stopped; "
-                            "refusing a fresh fallback"
-                        ) from error
-            elapsed_minutes = math.ceil((time.monotonic() - started) / 60)
-            fallback_minutes = spec.max_minutes - elapsed_minutes
+            global_deadline = started + spec.max_minutes * 60
+            dispositions: list[str] = []
+            last_unavailable: RetainedPodUnavailable | None = None
+            for pod_id in candidates:
+                candidate = replace(spec, reuse_pod_id=pod_id, reuse_pod_ids=())
+                with self.leases.claim(pod_id):
+                    try:
+                        result = self._execute(candidate, monotonic_deadline=global_deadline)
+                    except RetainedPodUnavailable as error:
+                        last_unavailable = error
+                        leases = [lease for lease in self.leases.all()
+                                  if lease.get("pod_id") == pod_id]
+                        if len(leases) != 1 or leases[0].get("state") != "paused-for-retest":
+                            raise RuntimeError(
+                                "retained Pod was unavailable but was not confirmed stopped; "
+                                "refusing another candidate or fresh fallback"
+                            ) from error
+                        dispositions.append("unavailable-preserved")
+                    else:
+                        dispositions.append("used")
+                        return replace(
+                            result,
+                            elapsed_seconds=time.monotonic() - started,
+                            requested=spec.receipt,
+                            reuse_candidate_dispositions=tuple(dispositions),
+                        )
+            if not spec.fallback_fresh_on_reuse_unavailable:
+                if last_unavailable is None:
+                    raise RuntimeError("no retained Pod candidate was attempted")
+                raise last_unavailable
+            remaining_seconds = int(global_deadline - time.monotonic())
+            fallback_minutes = remaining_seconds // 60
             if fallback_minutes < 1:
                 raise TimeoutError("no job budget remains for a fresh fallback")
-            self._log("retained Pod remained unavailable; allocating a fresh fallback")
-            fresh = self._execute(replace(
-                spec, reuse_pod_id=None, max_minutes=fallback_minutes
-            ))
+            self._log("all retained Pods remained unavailable; allocating a fresh fallback")
+            fresh = self._execute(
+                replace(spec, reuse_pod_id=None, reuse_pod_ids=(),
+                        max_minutes=fallback_minutes),
+                monotonic_deadline=global_deadline,
+            )
             return replace(
                 fresh,
                 elapsed_seconds=time.monotonic() - started,
@@ -345,6 +365,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 fresh_fallback_used=True,
                 fresh_fallback_max_minutes=fallback_minutes,
                 retained_pod_preserved_at_fallback=True,
+                reuse_candidate_dispositions=tuple(dispositions),
             )
         return self._execute(spec)
 
@@ -380,7 +401,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 )
                 time.sleep(delay)
 
-    def _execute(self, spec: JobSpec) -> JobResult:
+    def _execute(self, spec: JobSpec, monotonic_deadline: float | None = None) -> JobResult:
         started = time.monotonic()
         created = datetime.now(timezone.utc)
         public_key = self._public_key()
@@ -390,8 +411,10 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
         }
         # max_minutes bounds provisioning, setup, and execution. An explicit retest
         # window is recorded only after the Pod has completed and is being stopped.
-        expires = created + timedelta(minutes=spec.max_minutes)
-        monotonic_deadline = started + spec.max_minutes * 60
+        own_deadline = started + spec.max_minutes * 60
+        monotonic_deadline = min(monotonic_deadline, own_deadline) \
+            if monotonic_deadline is not None else own_deadline
+        expires = created + timedelta(seconds=max(0, monotonic_deadline - started))
         pending_id: str | None = None
         retained_lease: dict | None = None
         if spec.reuse_pod_id:
