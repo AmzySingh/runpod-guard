@@ -154,7 +154,8 @@ runpod-guard extend POD_ID --minutes 1440
 The command accepts at most one day from the time it runs. It succeeds only when the
 local lease belongs to the current API identity, the live Pod name still matches, and
 the provider confirms that the Pod is stopped. It takes the same exclusive lease lock
-as reuse and reaping, so an active job cannot be extended or deleted underneath itself.
+as reuse and normal reaping, so those operations cannot overlap. The emergency
+`reap --all-managed` command deliberately bypasses this lock and can delete active Pods.
 
 For a private repository, upload a Git archive from an existing local checkout. This
 does not forward GitHub credentials and includes only files tracked at the requested
