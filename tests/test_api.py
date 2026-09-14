@@ -42,6 +42,15 @@ class APITests(unittest.TestCase):
         with self.assertRaises(RunpodAPIError) as caught:
             RunpodAPI("top-secret", opener=opener).list_pods()
         self.assertNotIn("top-secret", str(caught.exception))
+        self.assertEqual(403, caught.exception.status_code)
+        self.assertFalse(caught.exception.retryable)
+
+    def test_server_and_network_errors_are_retryable(self):
+        self.assertTrue(RunpodAPIError("server", 500).retryable)
+        self.assertTrue(RunpodAPIError("network").retryable)
+        self.assertTrue(RunpodAPIError("request timeout", 408).retryable)
+        self.assertTrue(RunpodAPIError("rate limited", 429).retryable)
+        self.assertFalse(RunpodAPIError("bad request", 400).retryable)
 
     def test_delete_is_confirmed_by_listing(self):
         api = RunpodAPI("secret")

@@ -184,7 +184,7 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaises(RunpodAPIError):
                 runner.execute(JobSpec(
                     repo="https://example/repo", ref="def", command="pytest",
-                    max_minutes=10, reuse_pod_id="pod-1",
+                    max_minutes=10, reuse_pod_id="pod-1", reuse_start_attempts=1,
                 ))
             upgraded = runner.leases.all()[0]["pod_configuration"]
             self.assertIn("ssh_public_key_sha256", upgraded)
@@ -357,16 +357,166 @@ class RunnerTests(unittest.TestCase):
             api.start_pod = lambda _pod_id: (_ for _ in ()).throw(
                 RunpodAPIError("GPU is no longer available")
             )
-            with self.assertRaises(RunpodAPIError):
+            with patch("runpod_guard.runner.time.sleep") as sleep, self.assertRaises(RunpodAPIError):
                 runner.execute(JobSpec(
                     repo="https://example/repo", ref="def", command="pytest",
                     max_minutes=10, reuse_pod_id="pod-1",
                 ))
+            self.assertEqual(3, sleep.call_count)
             lease = runner.leases.all()[0]
             self.assertEqual(lease["state"], "paused-for-retest")
             self.assertEqual(lease["expires_at"], original_expiry)
             self.assertEqual(api.stopped, ["pod-1"])
             self.assertEqual(api.deleted, [])
+
+    def test_reuse_retries_temporary_start_failure_then_runs(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+            calls = 0
+            original_start = api.start_pod
+
+            def start(pod_id):
+                nonlocal calls
+                calls += 1
+                if calls < 3:
+                    raise RunpodAPIError("no free GPU", 500)
+                original_start(pod_id)
+
+            api.start_pod = start
+            with patch("runpod_guard.runner.time.sleep") as sleep, \
+                 patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_id="pod-1",
+                ))
+            self.assertTrue(result.ok)
+            self.assertEqual(3, calls)
+            self.assertEqual([20, 20], [call.args[0] for call in sleep.call_args_list])
+
+    def test_reuse_accepts_start_confirmed_after_lost_response(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+
+            calls = 0
+
+            def start(pod_id):
+                nonlocal calls
+                calls += 1
+                api.pods[pod_id]["desiredStatus"] = "RUNNING"
+                raise RunpodAPIError("start response was lost")
+
+            api.start_pod = start
+            with patch("runpod_guard.runner.time.sleep") as sleep, \
+                 patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_id="pod-1",
+                ))
+            self.assertTrue(result.ok)
+            self.assertEqual(1, calls)
+            sleep.assert_not_called()
+
+    def test_signal_during_reuse_retry_restores_stopped_lease(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                first = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+
+            original_handler = signal.getsignal(signal.SIGTERM)
+            api.stopped.clear()
+            api.start_pod = lambda _pod_id: (_ for _ in ()).throw(
+                RunpodAPIError("temporary server error", 500)
+            )
+            with patch("runpod_guard.runner.time.sleep", side_effect=lambda _: signal.raise_signal(
+                    signal.SIGTERM)), self.assertRaises(KeyboardInterrupt):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_id="pod-1",
+                ))
+            lease = runner.leases.all()[0]
+            self.assertEqual("paused-for-retest", lease["state"])
+            self.assertEqual(first.retest_expires_at, lease["expires_at"])
+            self.assertEqual(["pod-1"], api.stopped)
+            self.assertIs(signal.getsignal(signal.SIGTERM), original_handler)
+
+    def test_reuse_does_not_retry_permanent_start_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+            calls = 0
+
+            def start(_pod_id):
+                nonlocal calls
+                calls += 1
+                raise RunpodAPIError("forbidden", 403)
+
+            api.start_pod = start
+            with patch("runpod_guard.runner.time.sleep") as sleep, self.assertRaises(RunpodAPIError), \
+                 patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_id="pod-1",
+                ))
+            self.assertEqual(1, calls)
+            sleep.assert_not_called()
+
+    def test_reuse_does_not_start_again_after_retry_deadline(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            calls = 0
+            budget_checks = 0
+
+            def start(_pod_id):
+                nonlocal calls
+                calls += 1
+                raise RunpodAPIError("temporary server error", 500)
+
+            def remaining():
+                nonlocal budget_checks
+                budget_checks += 1
+                if budget_checks > 2:
+                    raise TimeoutError("deadline reached")
+                return 1
+
+            api.start_pod = start
+            spec = JobSpec(
+                repo="https://example/repo", ref="abc", command="pytest",
+                reuse_pod_id="pod-1",
+            )
+            with patch("runpod_guard.runner.time.sleep") as sleep, \
+                 self.assertRaisesRegex(TimeoutError, "deadline reached"):
+                runner._start_retained_pod("pod-1", spec, remaining)
+            self.assertEqual(1, calls)
+            sleep.assert_called_once_with(1)
 
     def test_local_source_is_archived_uploaded_and_extracted(self):
         with tempfile.TemporaryDirectory() as root:
