@@ -52,6 +52,13 @@ def parser() -> argparse.ArgumentParser:
     reap.add_argument("--all-managed", action="store_true",
                       help="delete every Pod whose name starts rpg-, even before its deadline")
 
+    extend = subcommands.add_parser(
+        "extend", help="extend the lease of a guard-owned stopped Pod"
+    )
+    extend.add_argument("pod_id", help="ID of the retained Pod")
+    extend.add_argument("--minutes", type=int, required=True,
+                        help="new retention window from now (1-1440 minutes)")
+
     run = subcommands.add_parser("run", help="run one bounded job")
     source = run.add_mutually_exclusive_group(required=True)
     source.add_argument("--repo", help="public HTTPS Git repository")
@@ -100,6 +107,10 @@ def main(argv: list[str] | None = None) -> int:
         removed = runner.reap(args.all_managed)
         print(json.dumps({"removed": removed, "failures": runner.reap_failures}))
         return 1 if runner.reap_failures else 0
+    if args.action == "extend":
+        expires_at = runner.extend_retest(args.pod_id, args.minutes)
+        print(json.dumps({"pod_id": args.pod_id, "retest_expires_at": expires_at}, indent=2))
+        return 0
     spec = JobSpec(
         repo=args.repo, source_dir=args.source, ref=args.ref,
         command=args.command, setup=args.setup,

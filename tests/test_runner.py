@@ -5,6 +5,7 @@ import threading
 import unittest
 import subprocess
 import signal
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -119,6 +120,46 @@ class RunnerTests(unittest.TestCase):
             self.assertTrue(second.ok)
             self.assertEqual(api.started, ["pod-1"])
             self.assertEqual(api.deleted, ["pod-1"])
+
+    def test_stopped_retest_lease_can_be_extended_without_starting_gpu(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+            before = datetime.now(timezone.utc)
+            expiry = datetime.fromisoformat(runner.extend_retest("pod-1", 1440))
+            self.assertGreaterEqual((expiry - before).total_seconds(), 1439 * 60)
+            self.assertEqual(api.started, [])
+            self.assertEqual(api.pods["pod-1"]["desiredStatus"], "EXITED")
+            self.assertEqual(runner.leases.all()[0]["expires_at"], expiry.isoformat())
+
+    def test_extend_refuses_running_or_unowned_pod_and_invalid_window(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+            api.pods["pod-1"]["desiredStatus"] = "RUNNING"
+            with self.assertRaisesRegex(RuntimeError, "is not stopped"):
+                runner.extend_retest("pod-1", 60)
+            api.pods["pod-1"]["desiredStatus"] = "EXITED"
+            lease = runner.leases.all()[0]
+            lease["api_identity"] = "someone-else"
+            runner.leases.put("pod-1", {key: value for key, value in lease.items() if key != "_path"})
+            with self.assertRaisesRegex(RuntimeError, "this API identity"):
+                runner.extend_retest("pod-1", 60)
+            for minutes in (0, 1441):
+                with self.assertRaisesRegex(ValueError, "between 1 and 1440"):
+                    runner.extend_retest("pod-1", minutes)
 
     def test_reuse_rejects_changed_immutable_pod_configuration(self):
         with tempfile.TemporaryDirectory() as root:

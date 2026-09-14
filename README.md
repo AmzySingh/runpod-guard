@@ -145,6 +145,17 @@ The attempts stay inside `max_minutes`. Adjust the two retry options when a long
 The reaper deletes the stopped Pod after the deadline; Runpod
 charges for its volume until deletion.
 
+If a stopped Pod is still needed, extend its lease without starting the GPU:
+
+```bash
+runpod-guard extend POD_ID --minutes 1440
+```
+
+The command accepts at most one day from the time it runs. It succeeds only when the
+local lease belongs to the current API identity, the live Pod name still matches, and
+the provider confirms that the Pod is stopped. It takes the same exclusive lease lock
+as reuse and reaping, so an active job cannot be extended or deleted underneath itself.
+
 For a private repository, upload a Git archive from an existing local checkout. This
 does not forward GitHub credentials and includes only files tracked at the requested
 revision, so ignored files such as `.env` are not copied:
