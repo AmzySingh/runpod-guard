@@ -124,7 +124,9 @@ runpod-guard run \
   --ref NEW_COMMIT_SHA \
   --command 'pytest' \
   --max-minutes 30 \
-  --reuse-pod POD_ID
+  --reuse-pod POD_ID \
+  --reuse-start-attempts 4 \
+  --reuse-start-delay-seconds 20
 ```
 
 Pass `--retest-window-minutes` again to retain it after another run. Retest jobs use
@@ -137,7 +139,10 @@ a fresh checkout. For a retained or reused Pod, the checkout is
 with the Pod and must not be treated as persistent. The runner binds a retained Pod
 to its original GPU choices, cloud, image, disk sizes and environment;
 repeat those options unchanged on reuse. Restarting also depends on GPU capacity and
-is not guaranteed. The reaper deletes the stopped Pod after the deadline; Runpod
+is not guaranteed. By default, a reused Pod gets four start attempts, 20 seconds apart.
+Only temporary network/server failures are retried; permanent API errors fail immediately.
+The attempts stay inside `max_minutes`. Adjust the two retry options when a longer wait is useful.
+The reaper deletes the stopped Pod after the deadline; Runpod
 charges for its volume until deletion.
 
 For a private repository, upload a Git archive from an existing local checkout. This

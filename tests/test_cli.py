@@ -19,6 +19,8 @@ class CLITests(unittest.TestCase):
         ])
         self.assertEqual(args.retest_window_minutes, 15)
         self.assertEqual(args.reuse_pod, "pod-1")
+        self.assertEqual(args.reuse_start_attempts, 4)
+        self.assertEqual(args.reuse_start_delay_seconds, 20)
 
 
 if __name__ == "__main__":

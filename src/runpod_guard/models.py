@@ -56,6 +56,8 @@ class JobSpec:
     workspace_gb: int = 20
     retest_window_minutes: int = 0
     reuse_pod_id: str | None = None
+    reuse_start_attempts: int = 4
+    reuse_start_delay_seconds: int = 20
     artifacts: tuple[Artifact, ...] = ()
     name: str = "job"
     env: dict[str, str] = field(default_factory=dict)
@@ -93,6 +95,10 @@ class JobSpec:
         if (self.reuse_pod_id is not None and
                 not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", self.reuse_pod_id)):
             raise ValueError("reuse_pod_id has an unexpected format")
+        if not 1 <= self.reuse_start_attempts <= 10:
+            raise ValueError("reuse_start_attempts must be between 1 and 10")
+        if not 1 <= self.reuse_start_delay_seconds <= 300:
+            raise ValueError("reuse_start_delay_seconds must be between 1 and 300")
         if (self.max_cost_per_hour is not None and
                 (not math.isfinite(self.max_cost_per_hour) or self.max_cost_per_hour <= 0)):
             raise ValueError("max_cost_per_hour must be positive")
@@ -135,6 +141,8 @@ class JobSpec:
             "max_cost_per_hour": self.max_cost_per_hour,
             "retest_window_minutes": self.retest_window_minutes,
             "reuse_requested": self.reuse_pod_id is not None,
+            "reuse_start_attempts": self.reuse_start_attempts,
+            "reuse_start_delay_seconds": self.reuse_start_delay_seconds,
         }
 
 

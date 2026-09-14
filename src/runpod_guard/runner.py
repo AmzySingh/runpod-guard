@@ -288,6 +288,22 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 return self._execute(spec)
         return self._execute(spec)
 
+    def _start_retained_pod(self, pod_id: str, spec: JobSpec,
+                            remaining: Callable[[], int]) -> None:
+        for attempt in range(1, spec.reuse_start_attempts + 1):
+            try:
+                self.api.start_pod(pod_id)
+                return
+            except RunpodAPIError as error:
+                if not error.retryable or attempt == spec.reuse_start_attempts:
+                    raise
+                delay = min(spec.reuse_start_delay_seconds, remaining())
+                self._log(
+                    f"retained Pod start attempt {attempt}/{spec.reuse_start_attempts} failed; "
+                    f"retrying in {delay} seconds"
+                )
+                time.sleep(delay)
+
     def _execute(self, spec: JobSpec) -> JobResult:
         started = time.monotonic()
         created = datetime.now(timezone.utc)
@@ -394,7 +410,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 self.leases.remove(pending_id)
                 self._log(f"created {pod_id} ({name}); hard deadline {expires.isoformat()}")
             else:
-                self.api.start_pod(pod_id)
+                self._start_retained_pod(pod_id, spec, remaining)
                 self._log(f"restarting retained Pod {pod_id}; hard deadline {expires.isoformat()}")
             if threading.current_thread() is threading.main_thread():
                 for signum in (signal.SIGINT, signal.SIGTERM):

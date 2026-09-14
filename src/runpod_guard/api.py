@@ -11,6 +11,14 @@ from typing import Any, Callable
 class RunpodAPIError(RuntimeError):
     """A Runpod REST request failed."""
 
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+    @property
+    def retryable(self) -> bool:
+        return self.status_code is None or self.status_code >= 500
+
 
 class RunpodAPI:
     def __init__(self, api_key: str, base_url: str = "https://rest.runpod.io/v1",
@@ -43,7 +51,9 @@ class RunpodAPI:
                 return json.loads(raw) if raw.strip() else {}
         except urllib.error.HTTPError as error:
             detail = error.read().decode(errors="replace")[:800].replace(self.api_key, "[REDACTED]")
-            raise RunpodAPIError(f"Runpod {method} {path} returned {error.code}: {detail}") from None
+            raise RunpodAPIError(
+                f"Runpod {method} {path} returned {error.code}: {detail}", error.code
+            ) from None
         except urllib.error.URLError as error:
             raise RunpodAPIError(f"Runpod {method} {path} failed: {error.reason}") from error
         except TimeoutError as error:
