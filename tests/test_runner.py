@@ -442,6 +442,46 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(3, calls)
             self.assertEqual([20, 20], [call.args[0] for call in sleep.call_args_list])
 
+    def test_reuse_can_fall_back_to_fresh_only_after_retryable_start_attempts(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                first = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+
+            def unavailable(_pod_id):
+                raise RunpodAPIError("no free GPU", 500)
+
+            def fresh(body):
+                api.body = body
+                pod = {"id": "pod-2", "name": body["name"], "costPerHr": "0.40",
+                       "desiredStatus": "RUNNING", "env": dict(body["env"])}
+                api.pods[pod["id"]] = pod
+                return pod
+
+            api.start_pod = unavailable
+            api.create_pod = fresh
+            with patch("runpod_guard.runner.time.sleep") as sleep, \
+                 patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_id="pod-1", reuse_start_attempts=2,
+                    fallback_fresh_on_reuse_unavailable=True,
+                ))
+
+            self.assertTrue(result.ok)
+            self.assertEqual(9, result.requested["max_minutes"])
+            self.assertEqual([20], [call.args[0] for call in sleep.call_args_list])
+            self.assertEqual(["pod-2"], api.deleted)
+            retained = runner.leases.all()[0]
+            self.assertEqual("pod-1", retained["pod_id"])
+            self.assertEqual(first.retest_expires_at, retained["expires_at"])
+
     def test_reuse_accepts_start_confirmed_after_lost_response(self):
         with tempfile.TemporaryDirectory() as root:
             api = FakeAPI()

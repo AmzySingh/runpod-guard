@@ -14,6 +14,7 @@ class ModelTests(unittest.TestCase):
         self.assertNotIn("environment_sha256", spec.receipt)
         self.assertEqual(spec.receipt["cloud"], "SECURE")
         self.assertFalse(spec.receipt["reuse_requested"])
+        self.assertFalse(spec.receipt["fallback_fresh_on_reuse_unavailable"])
 
     def test_rejects_unsafe_values(self):
         with self.assertRaises(ValueError):

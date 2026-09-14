@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import math
@@ -19,6 +20,10 @@ from typing import Callable
 from .api import RunpodAPI, RunpodAPIError
 from .models import Artifact, JobResult, JobSpec
 from .state import LeaseStore
+
+
+class RetainedPodUnavailable(RunpodAPIError):
+    """A retained Pod stayed stopped after every retryable start attempt."""
 
 
 class RunpodRunner:
@@ -311,8 +316,28 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
 
     def execute(self, spec: JobSpec) -> JobResult:
         if spec.reuse_pod_id:
+            started = time.monotonic()
             with self.leases.claim(spec.reuse_pod_id):
-                return self._execute(spec)
+                try:
+                    return self._execute(spec)
+                except RetainedPodUnavailable as error:
+                    if not spec.fallback_fresh_on_reuse_unavailable:
+                        raise
+                    leases = [lease for lease in self.leases.all()
+                              if lease.get("pod_id") == spec.reuse_pod_id]
+                    if len(leases) != 1 or leases[0].get("state") != "paused-for-retest":
+                        raise RuntimeError(
+                            "retained Pod was unavailable but was not confirmed stopped; "
+                            "refusing a fresh fallback"
+                        ) from error
+            elapsed_minutes = math.ceil((time.monotonic() - started) / 60)
+            fallback_minutes = spec.max_minutes - elapsed_minutes
+            if fallback_minutes < 1:
+                raise TimeoutError("no job budget remains for a fresh fallback")
+            self._log("retained Pod remained unavailable; allocating a fresh fallback")
+            return self._execute(replace(
+                spec, reuse_pod_id=None, max_minutes=fallback_minutes
+            ))
         return self._execute(spec)
 
     def _start_retained_pod(self, pod_id: str, spec: JobSpec,
@@ -336,8 +361,10 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                     if status == "RUNNING":
                         self._log("retained Pod start was confirmed after a failed response")
                         return
-                if not error.retryable or attempt == spec.reuse_start_attempts:
+                if not error.retryable:
                     raise
+                if attempt == spec.reuse_start_attempts:
+                    raise RetainedPodUnavailable(str(error), error.status_code) from error
                 delay = min(spec.reuse_start_delay_seconds, remaining())
                 self._log(
                     f"retained Pod start attempt {attempt}/{spec.reuse_start_attempts} failed; "

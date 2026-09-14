@@ -84,6 +84,8 @@ def parser() -> argparse.ArgumentParser:
                      help="start attempts for a retained Pod (default: 4)")
     run.add_argument("--reuse-start-delay-seconds", type=int, default=20,
                      help="wait between retained-Pod start attempts (default: 20)")
+    run.add_argument("--fallback-fresh-on-reuse-unavailable", action="store_true",
+                     help="allocate a fresh Pod after all retryable retained-Pod start attempts fail")
     run.add_argument("--fetch", action="append", type=artifact, default=[])
     run.add_argument("--name", default="job")
     return command
@@ -122,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         reuse_pod_id=args.reuse_pod,
         reuse_start_attempts=args.reuse_start_attempts,
         reuse_start_delay_seconds=args.reuse_start_delay_seconds,
+        fallback_fresh_on_reuse_unavailable=args.fallback_fresh_on_reuse_unavailable,
         artifacts=tuple(args.fetch), name=args.name,
     )
     result = runner.execute(spec)

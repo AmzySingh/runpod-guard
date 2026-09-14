@@ -126,7 +126,8 @@ runpod-guard run \
   --max-minutes 30 \
   --reuse-pod POD_ID \
   --reuse-start-attempts 4 \
-  --reuse-start-delay-seconds 20
+  --reuse-start-delay-seconds 20 \
+  --fallback-fresh-on-reuse-unavailable
 ```
 
 Pass `--retest-window-minutes` again to retain it after another run. Retest jobs use
@@ -142,6 +143,11 @@ repeat those options unchanged on reuse. Restarting also depends on GPU capacity
 is not guaranteed. By default, a reused Pod gets four start attempts, 20 seconds apart.
 Only temporary network/server failures are retried; permanent API errors fail immediately.
 The attempts stay inside `max_minutes`. Adjust the two retry options when a longer wait is useful.
+With `--fallback-fresh-on-reuse-unavailable`, exhausting those retryable start attempts
+allocates a fresh Pod using the requested GPU fallback list. It does not retry setup,
+the job command, model output, artifact retrieval, permanent API errors, or timeouts.
+Fallback happens only after the retained Pod is confirmed stopped, and time spent on
+start attempts is deducted from the original job deadline.
 The reaper deletes the stopped Pod after the deadline; Runpod
 charges for its volume until deletion.
 

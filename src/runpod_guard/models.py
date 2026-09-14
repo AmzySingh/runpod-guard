@@ -58,6 +58,7 @@ class JobSpec:
     reuse_pod_id: str | None = None
     reuse_start_attempts: int = 4
     reuse_start_delay_seconds: int = 20
+    fallback_fresh_on_reuse_unavailable: bool = False
     artifacts: tuple[Artifact, ...] = ()
     name: str = "job"
     env: dict[str, str] = field(default_factory=dict)
@@ -143,6 +144,7 @@ class JobSpec:
             "reuse_requested": self.reuse_pod_id is not None,
             "reuse_start_attempts": self.reuse_start_attempts,
             "reuse_start_delay_seconds": self.reuse_start_delay_seconds,
+            "fallback_fresh_on_reuse_unavailable": self.fallback_fresh_on_reuse_unavailable,
         }
 
 
