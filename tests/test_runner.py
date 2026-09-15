@@ -10,8 +10,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from runpod_guard.api import RunpodAPIError
-from runpod_guard.models import JobSpec
-from runpod_guard.runner import RunpodRunner
+from runpod_guard.models import JobResult, JobSpec
+from runpod_guard.runner import RetainedPodUnavailable, RunpodRunner
 from runpod_guard.state import LeaseStore
 
 
@@ -78,6 +78,7 @@ class RunnerTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertEqual(api.deleted, ["pod-1"])
             self.assertEqual(api.body["volumeInGb"], 0)
+            self.assertEqual(api.body["gpuTypePriority"], "custom")
             self.assertNotIn("RUNPOD_API_KEY", api.body["env"])
             self.assertIn("PUBLIC_KEY", api.body["env"])
             self.assertIn("runpodctl pod delete", scripts[0])
@@ -88,6 +89,20 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("RUNPOD_GUARD_CACHE=/root/runpod-guard-cache", scripts[2])
             self.assertNotIn("RUNPOD_GUARD_CACHE=/workspace/runpod-guard-cache", scripts[2])
             self.assertNotIn("--filter", scripts[2])
+
+    def test_availability_gpu_priority_is_sent_to_runpod(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="true",
+                    gpu_priority="availability",
+                ))
+            self.assertTrue(result.ok)
+            self.assertEqual("availability", api.body["gpuTypePriority"])
+            self.assertEqual("availability", result.requested["gpu_priority"])
 
     def test_completed_job_can_pause_for_bounded_retest_and_be_reused(self):
         with tempfile.TemporaryDirectory() as root:
@@ -442,6 +457,60 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(3, calls)
             self.assertEqual([20, 20], [call.args[0] for call in sleep.call_args_list])
 
+    def test_reuse_can_fall_back_to_fresh_only_after_retryable_start_attempts(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                first = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+
+            def unavailable(_pod_id):
+                raise RunpodAPIError("no free GPU", 500)
+
+            def fresh(body):
+                api.body = body
+                pod = {"id": "pod-2", "name": body["name"], "costPerHr": "0.40",
+                       "desiredStatus": "RUNNING", "env": dict(body["env"])}
+                api.pods[pod["id"]] = pod
+                return pod
+
+            api.start_pod = unavailable
+            api.create_pod = fresh
+            with patch("runpod_guard.runner.time.sleep") as sleep, \
+                 patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_ids=("pod-1",), reuse_start_attempts=2,
+                    gpu_priority="availability",
+                    fallback_fresh_on_reuse_unavailable=True,
+                ))
+
+            self.assertTrue(result.ok)
+            self.assertTrue(result.requested["reuse_requested"])
+            self.assertEqual(10, result.requested["max_minutes"])
+            self.assertTrue(result.fresh_fallback_used)
+            self.assertEqual(9, result.fresh_fallback_max_minutes)
+            self.assertTrue(result.retained_pod_preserved_at_fallback)
+            self.assertEqual(("unavailable-preserved",), result.reuse_candidate_dispositions)
+            self.assertGreater(result.elapsed_seconds, 0)
+            encoded = result.to_dict()
+            self.assertTrue(encoded["fresh_fallback_used"])
+            self.assertEqual(9, encoded["fresh_fallback_max_minutes"])
+            self.assertTrue(encoded["retained_pod_preserved_at_fallback"])
+            self.assertEqual(["unavailable-preserved"], encoded["reuse_candidate_dispositions"])
+            self.assertEqual([20], [call.args[0] for call in sleep.call_args_list])
+            self.assertEqual("availability", api.body["gpuTypePriority"])
+            self.assertEqual("availability", result.requested["gpu_priority"])
+            self.assertEqual(["pod-2"], api.deleted)
+            retained = runner.leases.all()[0]
+            self.assertEqual("pod-1", retained["pod_id"])
+            self.assertEqual(first.retest_expires_at, retained["expires_at"])
+
     def test_reuse_accepts_start_confirmed_after_lost_response(self):
         with tempfile.TemporaryDirectory() as root:
             api = FakeAPI()
@@ -525,9 +594,195 @@ class RunnerTests(unittest.TestCase):
                 runner.execute(JobSpec(
                     repo="https://example/repo", ref="def", command="pytest",
                     max_minutes=10, reuse_pod_id="pod-1",
+                    fallback_fresh_on_reuse_unavailable=True,
                 ))
             self.assertEqual(1, calls)
             sleep.assert_not_called()
+
+    def test_fresh_fallback_refuses_when_retained_cleanup_is_unconfirmed(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+            creates = 0
+            original_create = api.create_pod
+
+            def create(body):
+                nonlocal creates
+                creates += 1
+                return original_create(body)
+
+            api.create_pod = create
+            api.start_pod = lambda _pod_id: (_ for _ in ()).throw(
+                RunpodAPIError("no free GPU", 500)
+            )
+            api.stop_and_confirm = lambda _pod_id: False
+            api.delete_and_confirm = lambda _pod_id: False
+            with self.assertRaisesRegex(RuntimeError, "not confirmed stopped"):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_id="pod-1", reuse_start_attempts=1,
+                    fallback_fresh_on_reuse_unavailable=True,
+                ))
+            self.assertEqual(0, creates)
+
+    def test_fresh_fallback_refuses_when_retry_uses_whole_deadline(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            runner.leases.put("pod-1", {"pod_id": "pod-1", "state": "paused-for-retest"})
+            spec = JobSpec(
+                repo="https://example/repo", ref="abc", command="pytest",
+                max_minutes=10, reuse_pod_id="pod-1",
+                fallback_fresh_on_reuse_unavailable=True,
+            )
+            with patch.object(runner, "_execute", side_effect=RetainedPodUnavailable("busy", 500)) as execute, \
+                 patch("runpod_guard.runner.time.monotonic", side_effect=[0, 600]), \
+                 self.assertRaisesRegex(TimeoutError, "no job budget remains"):
+                runner.execute(spec)
+            execute.assert_called_once_with(spec, monotonic_deadline=600)
+
+    def test_ordered_reuse_advances_after_unavailable_candidate(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+            first_lease = runner.leases.all()[0]
+            second_name = "retained-second"
+            api.pods["pod-2"] = {**api.pods["pod-1"], "id": "pod-2", "name": second_name}
+            runner.leases.put("pod-2", {
+                **{key: value for key, value in first_lease.items() if key != "_path"},
+                "pod_id": "pod-2", "name": second_name,
+            })
+            original_start = api.start_pod
+
+            def start(pod_id):
+                if pod_id == "pod-1":
+                    raise RunpodAPIError("no free GPU", 500)
+                original_start(pod_id)
+
+            api.start_pod = start
+            with patch("runpod_guard.runner.time.sleep"), \
+                 patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_ids=("pod-1", "pod-2"),
+                    reuse_start_attempts=1,
+                ))
+
+            self.assertTrue(result.ok)
+            self.assertEqual(("unavailable-preserved", "used"),
+                             result.reuse_candidate_dispositions)
+            self.assertEqual(2, result.requested["reuse_candidate_count"])
+            self.assertNotIn("pod-1", str(result.to_dict()))
+            self.assertEqual(["pod-2"], api.started)
+            self.assertEqual(["pod-2"], api.deleted)
+            self.assertEqual("paused-for-retest", runner.leases.all()[0]["state"])
+
+    def test_ordered_reuse_all_unavailable_needs_fresh_opt_in(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            for pod_id in ("pod-1", "pod-2"):
+                runner.leases.put(pod_id, {
+                    "pod_id": pod_id, "state": "paused-for-retest",
+                })
+            spec = JobSpec(
+                repo="https://example/repo", ref="abc", command="pytest",
+                reuse_pod_ids=("pod-1", "pod-2"),
+            )
+
+            def unavailable(candidate, monotonic_deadline=None):
+                self.assertIsNotNone(monotonic_deadline)
+                raise RetainedPodUnavailable("busy", 500)
+
+            with patch.object(runner, "_execute", side_effect=unavailable) as execute, \
+                 self.assertRaises(RetainedPodUnavailable):
+                runner.execute(spec)
+            self.assertEqual(2, execute.call_count)
+
+    def test_ordered_reuse_falls_back_fresh_only_after_every_candidate(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            for pod_id in ("pod-1", "pod-2"):
+                runner.leases.put(pod_id, {
+                    "pod_id": pod_id, "state": "paused-for-retest",
+                })
+            calls = []
+
+            def execute(candidate, monotonic_deadline=None):
+                calls.append((candidate.reuse_pod_id, monotonic_deadline))
+                if candidate.reuse_pod_id:
+                    raise RetainedPodUnavailable("busy", 500)
+                return JobResult(
+                    pod_id="fresh-result", returncode=0, timed_out=False,
+                    artifacts_ok=True, terminated=True, elapsed_seconds=1,
+                    requested=candidate.receipt,
+                )
+
+            with patch("runpod_guard.runner.time.monotonic", return_value=100), \
+                 patch.object(runner, "_execute", side_effect=execute):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, reuse_pod_ids=("pod-1", "pod-2"),
+                    fallback_fresh_on_reuse_unavailable=True,
+                ))
+
+            self.assertEqual([("pod-1", 700), ("pod-2", 700), (None, 700)], calls)
+            self.assertTrue(result.fresh_fallback_used)
+            self.assertEqual(10, result.fresh_fallback_max_minutes)
+            self.assertEqual(
+                ("unavailable-preserved", "unavailable-preserved"),
+                result.reuse_candidate_dispositions,
+            )
+            self.assertEqual(2, result.requested["reuse_candidate_count"])
+
+    def test_ordered_reuse_aborts_on_permanent_error_without_trying_next(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            spec = JobSpec(
+                repo="https://example/repo", ref="abc", command="pytest",
+                reuse_pod_ids=("pod-1", "pod-2"),
+                fallback_fresh_on_reuse_unavailable=True,
+            )
+            with patch.object(runner, "_execute", side_effect=RunpodAPIError("forbidden", 403)) as execute, \
+                 self.assertRaises(RunpodAPIError):
+                runner.execute(spec)
+            self.assertEqual(1, execute.call_count)
+
+    def test_ordered_reuse_shares_one_deadline_and_aborts_timeout(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            for pod_id in ("pod-1", "pod-2"):
+                runner.leases.put(pod_id, {
+                    "pod_id": pod_id, "state": "paused-for-retest",
+                })
+            deadlines = []
+
+            def execute(_candidate, monotonic_deadline=None):
+                deadlines.append(monotonic_deadline)
+                if len(deadlines) == 1:
+                    raise RetainedPodUnavailable("busy", 500)
+                raise TimeoutError("shared deadline reached")
+
+            with patch("runpod_guard.runner.time.monotonic", return_value=100), \
+                 patch.object(runner, "_execute", side_effect=execute), \
+                 self.assertRaisesRegex(TimeoutError, "shared deadline"):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, reuse_pod_ids=("pod-1", "pod-2"),
+                    fallback_fresh_on_reuse_unavailable=True,
+                ))
+            self.assertEqual([700, 700], deadlines)
 
     def test_reuse_does_not_start_again_after_retry_deadline(self):
         with tempfile.TemporaryDirectory() as root:

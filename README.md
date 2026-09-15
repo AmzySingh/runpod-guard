@@ -124,12 +124,22 @@ runpod-guard run \
   --ref NEW_COMMIT_SHA \
   --command 'pytest' \
   --max-minutes 30 \
-  --reuse-pod POD_ID \
+  --reuse-pod FIRST_POD_ID \
+  --reuse-pod SECOND_POD_ID \
   --reuse-start-attempts 4 \
-  --reuse-start-delay-seconds 20
+  --reuse-start-delay-seconds 20 \
+  --fallback-fresh-on-reuse-unavailable
 ```
 
-Pass `--retest-window-minutes` again to retain it after another run. Retest jobs use
+Repeat `--reuse-pod` to try an explicit ordered list of compatible retained Pods.
+The runner advances only when a candidate exhausts its temporary start retries and
+is confirmed stopped with its lease restored. Ownership, configuration, permanent
+API, cleanup, and timeout failures stop the run. All candidates share the original
+`max_minutes` deadline. Fresh allocation remains separately opt-in and happens only
+after every candidate is unavailable. Receipts report the candidate count and safe
+dispositions without copying Pod IDs into the requested configuration.
+
+Pass `--retest-window-minutes` again to retain the Pod that ran the job. Retest jobs use
 a 20 GB Pod volume by default; adjust it with `--workspace-gb`. Runpod clears the
 container disk when a Pod stops, so only `/workspace` persists. Every invocation gets
 a fresh checkout. For a retained or reused Pod, the checkout is
@@ -142,6 +152,13 @@ repeat those options unchanged on reuse. Restarting also depends on GPU capacity
 is not guaranteed. By default, a reused Pod gets four start attempts, 20 seconds apart.
 Only temporary network/server failures are retried; permanent API errors fail immediately.
 The attempts stay inside `max_minutes`. Adjust the two retry options when a longer wait is useful.
+With `--fallback-fresh-on-reuse-unavailable`, exhausting those retryable start attempts
+allocates a fresh Pod using the requested GPU fallback list. It does not retry setup,
+the job command, model output, artifact retrieval, permanent API errors, or timeouts.
+Fallback happens only after the retained Pod is confirmed stopped, and time spent on
+start attempts is deducted from the original job deadline.
+The final receipt keeps the original request and total elapsed time, and records the
+effective fresh-Pod budget plus whether the retained candidates were preserved.
 The reaper deletes the stopped Pod after the deadline; Runpod
 charges for its volume until deletion.
 
@@ -180,6 +197,11 @@ Profiles are ordered availability fallbacks:
 | `xlarge` | 80 GB | A100 PCIe, A100 SXM |
 
 Use repeated `--gpu` flags to replace a profile with exact Runpod GPU IDs.
+The default `--gpu-priority custom` asks Runpod to follow that list in order.
+Use `--gpu-priority availability` to let Runpod choose from the same compatible list
+based on current capacity. The choice is recorded in receipts and treated as part of
+the fresh allocation request. It does not affect or restrict an already-created
+retained Pod, so it can be changed when fresh fallback is enabled.
 
 Operational commands:
 

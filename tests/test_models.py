@@ -13,7 +13,30 @@ class ModelTests(unittest.TestCase):
         self.assertNotIn("command", spec.receipt)
         self.assertNotIn("environment_sha256", spec.receipt)
         self.assertEqual(spec.receipt["cloud"], "SECURE")
+        self.assertNotIn("gpu_priority", spec.pod_configuration)
+        self.assertEqual(spec.receipt["gpu_priority"], "custom")
         self.assertFalse(spec.receipt["reuse_requested"])
+        self.assertEqual(spec.receipt["reuse_candidate_count"], 0)
+        self.assertFalse(spec.receipt["fallback_fresh_on_reuse_unavailable"])
+
+        ordered = JobSpec(
+            repo="https://example/repo", ref="abc", command="true",
+            reuse_pod_ids=("candidate-a", "candidate-b"),
+        )
+        self.assertEqual(ordered.retained_pod_ids, ("candidate-a", "candidate-b"))
+        self.assertEqual(ordered.receipt["reuse_candidate_count"], 2)
+        self.assertNotIn("candidate-a", str(ordered.receipt))
+
+        artifact = Artifact("out/result")
+        positional = JobSpec(
+            "https://example/repo", "abc", "true", "", None, "small", (), "SECURE",
+            60, 1.0, "image", 40, 20, 0, None, 4, 20, (artifact,), "positional",
+            {"KEY": "value"},
+        )
+        self.assertEqual(positional.artifacts, (artifact,))
+        self.assertEqual(positional.name, "positional")
+        self.assertEqual(positional.env, {"KEY": "value"})
+        self.assertFalse(positional.fallback_fresh_on_reuse_unavailable)
 
     def test_rejects_unsafe_values(self):
         with self.assertRaises(ValueError):
@@ -24,9 +47,21 @@ class ModelTests(unittest.TestCase):
             JobSpec(repo="https://example/repo", ref="y", command="z", max_minutes=0)
         with self.assertRaises(ValueError):
             JobSpec(repo="https://example/repo", ref="y", command="z",
+                    gpu_priority="cheapest")
+        with self.assertRaises(ValueError):
+            JobSpec(repo="https://example/repo", ref="y", command="z",
                     retest_window_minutes=1441)
         with self.assertRaises(ValueError):
             JobSpec(repo="https://example/repo", ref="y", command="z", reuse_pod_id="bad/id")
+        with self.assertRaises(ValueError):
+            JobSpec(repo="https://example/repo", ref="y", command="z",
+                    reuse_pod_ids=("valid", "bad/id"))
+        with self.assertRaises(ValueError):
+            JobSpec(repo="https://example/repo", ref="y", command="z",
+                    reuse_pod_ids=("same", "same"))
+        with self.assertRaises(ValueError):
+            JobSpec(repo="https://example/repo", ref="y", command="z",
+                    reuse_pod_id="one", reuse_pod_ids=("two",))
         with self.assertRaises(ValueError):
             JobSpec(repo="https://example/repo", ref="y", command="z", reuse_start_attempts=0)
         with self.assertRaises(ValueError):
