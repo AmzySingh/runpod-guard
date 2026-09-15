@@ -66,12 +66,21 @@ class JobSpec:
     fallback_fresh_on_reuse_unavailable: bool = False
     reuse_pod_ids: tuple[str, ...] = ()
     gpu_priority: str = "custom"
+    # Append new fields to preserve the positional Python API.
+    source_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.ref or not self.command:
             raise ValueError("ref and command are required")
         if bool(self.repo) == bool(self.source_dir):
             raise ValueError("exactly one of repo or source_dir is required")
+        if self.source_paths and self.source_dir is None:
+            raise ValueError("source_paths requires source_dir (--source)")
+        for path in self.source_paths:
+            if (not path or path.startswith(("/", "-")) or
+                    not re.fullmatch(r"[A-Za-z0-9._ /-]+", path) or
+                    any(part in {"", ".", ".."} for part in path.rstrip("/").split("/"))):
+                raise ValueError("source paths must be literal relative file or directory paths")
         if self.repo:
             parsed_repo = urlsplit(self.repo)
             if (parsed_repo.scheme != "https" or not parsed_repo.hostname or

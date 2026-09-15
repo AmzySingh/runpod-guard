@@ -69,6 +69,20 @@ class CLITests(unittest.TestCase):
         ])
         self.assertEqual(args.gpu_priority, "availability")
 
+    def test_source_path_options(self):
+        args = parser().parse_args([
+            "run", "--source", ".", "--ref", "abc", "--command", "true",
+            "--source-path", "runtime", "--source-path", ".source-revision",
+        ])
+        self.assertEqual(args.source_path, ["runtime", ".source-revision"])
+        with patch("runpod_guard.cli.load_dotenv"), \
+             patch("runpod_guard.cli.RunpodRunner"), \
+             patch("runpod_guard.cli.JobSpec", side_effect=RuntimeError("captured")) as spec:
+            with self.assertRaisesRegex(RuntimeError, "captured"):
+                main(["run", "--source", ".", "--ref", "abc", "--command", "true",
+                      "--source-path", "runtime", "--source-path", ".source-revision"])
+        self.assertEqual(spec.call_args.kwargs["source_paths"], ("runtime", ".source-revision"))
+
     def test_extend_options(self):
         args = parser().parse_args(["extend", "pod-1", "--minutes", "1440"])
         self.assertEqual(args.action, "extend")

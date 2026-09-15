@@ -195,6 +195,32 @@ runpod-guard run \
   --command 'python -m project.model_test'
 ```
 
+For a large checkout, repeat `--source-path` to upload only the files and directories
+needed by the job:
+
+```bash
+runpod-guard run \
+  --source /path/to/project --ref COMMIT_SHA \
+  --source-path runtime --source-path pyproject.toml \
+  --source-path .source-revision \
+  --command 'python -m runtime.model_test'
+```
+
+This option requires `--source`. Each value is a literal path relative to the Git
+checkout root; directories include their tracked descendants. Quote paths containing
+spaces. Globs, Git pathspec magic, absolute paths, `.`/`..` components, and values
+starting with `-` are rejected. Every selection must contain tracked files at the
+requested revision, even when other selections are valid. Validation runs before a
+Pod is created or resumed. The revision is resolved to a commit once, so a branch
+moving during startup cannot change the selected archive. Receipts show that commit.
+
+Git archive attributes still apply, including `export-ignore` and `export-subst`.
+Select any required revision marker explicitly (such as `.source-revision` above);
+its committed `export-subst` rule works even if `.gitattributes` is not selected.
+Include all build inputs yourself: no dependencies or marker files are added
+automatically. Without `--source-path`, the existing full archive behavior is unchanged.
+The Python API exposes the same option as `JobSpec(source_paths=("runtime", ...))`.
+
 Profiles are ordered availability fallbacks:
 
 | Profile | Intended size | Default GPU choices |
