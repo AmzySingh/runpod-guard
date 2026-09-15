@@ -315,12 +315,31 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             return expires.isoformat()
 
     def execute(self, spec: JobSpec) -> JobResult:
+        """Run a job; post-allocation exceptions carry a sanitized ``job_result``."""
+        started = time.monotonic()
+        try:
+            return self._execute_candidates(spec)
+        except BaseException as error:
+            # Keep the original exception type (including cancellation and retained
+            # capacity errors), while exposing the completed teardown to callers.
+            result = getattr(error, "job_result", None)
+            if result is None:
+                result = getattr(error.__cause__, "job_result", None)
+            if isinstance(result, JobResult):
+                error.job_result = replace(
+                    result, requested=spec.receipt,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+            raise
+
+    def _execute_candidates(self, spec: JobSpec) -> JobResult:
         candidates = spec.retained_pod_ids
         if candidates:
             started = time.monotonic()
             global_deadline = started + spec.max_minutes * 60
             dispositions: list[str] = []
             last_unavailable: RetainedPodUnavailable | None = None
+            last_managed_result: JobResult | None = None
             for pod_id in candidates:
                 candidate = replace(spec, reuse_pod_id=pod_id, reuse_pod_ids=())
                 with self.leases.claim(pod_id):
@@ -336,6 +355,28 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                                 "refusing another candidate or fresh fallback"
                             ) from error
                         dispositions.append("unavailable-preserved")
+                        if isinstance(getattr(error, "job_result", None), JobResult):
+                            error.job_result = replace(
+                                error.job_result,
+                                reuse_candidate_dispositions=tuple(dispositions),
+                            )
+                            last_managed_result = error.job_result
+                    except BaseException as error:
+                        result = getattr(error, "job_result", None)
+                        if isinstance(result, JobResult):
+                            error.job_result = replace(
+                                result,
+                                reuse_candidate_dispositions=tuple(dispositions + ["failed"]),
+                            )
+                        elif last_managed_result is not None:
+                            # A later candidate can fail validation before it has a
+                            # Pod receipt of its own. Keep the earlier managed result.
+                            error.job_result = replace(
+                                last_managed_result,
+                                failure_stage="retained_candidate",
+                                reuse_candidate_dispositions=tuple(dispositions + ["failed"]),
+                            )
+                        raise
                     else:
                         dispositions.append("used")
                         return replace(
@@ -351,13 +392,43 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             remaining_seconds = int(global_deadline - time.monotonic())
             fallback_minutes = remaining_seconds // 60
             if fallback_minutes < 1:
-                raise TimeoutError("no job budget remains for a fresh fallback")
+                error = TimeoutError("no job budget remains for a fresh fallback")
+                if last_managed_result is not None:
+                    error.job_result = replace(
+                        last_managed_result,
+                        timed_out=True,
+                        failure_stage="fresh_fallback_budget",
+                        reuse_candidate_dispositions=tuple(dispositions),
+                    )
+                raise error
             self._log("all retained Pods remained unavailable; allocating a fresh fallback")
-            fresh = self._execute(
-                replace(spec, reuse_pod_id=None, reuse_pod_ids=(),
-                        max_minutes=fallback_minutes),
-                monotonic_deadline=global_deadline,
-            )
+            try:
+                fresh = self._execute(
+                    replace(spec, reuse_pod_id=None, reuse_pod_ids=(),
+                            max_minutes=fallback_minutes),
+                    monotonic_deadline=global_deadline,
+                )
+            except BaseException as error:
+                result = getattr(error, "job_result", None)
+                if isinstance(result, JobResult):
+                    error.job_result = replace(
+                        result,
+                        fresh_fallback_used=True,
+                        fresh_fallback_max_minutes=fallback_minutes,
+                        retained_pod_preserved_at_fallback=True,
+                        reuse_candidate_dispositions=tuple(dispositions),
+                    )
+                elif last_managed_result is not None:
+                    # Fresh setup can fail before allocation. The retained-Pod
+                    # receipt still proves the managed lifecycle already completed.
+                    error.job_result = replace(
+                        last_managed_result,
+                        failure_stage="fresh_fallback",
+                        fresh_fallback_max_minutes=fallback_minutes,
+                        retained_pod_preserved_at_fallback=True,
+                        reuse_candidate_dispositions=tuple(dispositions),
+                    )
+                raise
             return replace(
                 fresh,
                 elapsed_seconds=time.monotonic() - started,
@@ -488,6 +559,8 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
         ip: str | None = None
         port: int | None = None
         previous_handlers: dict[int, object] = {}
+        failure: BaseException | None = None
+        stage = "lease"
 
         def interrupted(signum, _frame):
             raise KeyboardInterrupt(f"received signal {signum}")
@@ -512,32 +585,42 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 self.leases.remove(pending_id)
                 self._log(f"created {pod_id} ({name}); hard deadline {expires.isoformat()}")
             else:
+                stage = "retained_start"
                 self._start_retained_pod(pod_id, spec, remaining)
                 self._log(f"restarting retained Pod {pod_id}; hard deadline {expires.isoformat()}")
             if retained_lease is None:
+                stage = "cost_check"
                 self._require_bounded_cost(cost, spec.max_cost_per_hour)
+            stage = "address"
             ip, port = self._wait_for_address(pod_id, min(900, remaining()))
             if retained_lease is not None:
                 # A stopped Pod may report only storage cost. Check refreshed running cost.
+                stage = "cost_check"
                 cost = self._cost(self.api.get_pod(pod_id))
                 self._require_bounded_cost(cost, spec.max_cost_per_hour)
+            stage = "ssh_ready"
             self._wait_for_ssh(ip, port, min(300, remaining()))
             # Five minutes beyond the local deadline is enough for ordinary local
             # teardown, but still bounds spend if this process or host disappears.
+            stage = "watchdog"
             watchdog_seconds = remaining() + 300
             if self._ssh(ip, port, self._watchdog_script(pod_id, watchdog_seconds), 60) != 0:
                 raise RuntimeError("could not arm the independent on-Pod termination watchdog")
             self._log("independent on-Pod watchdog armed")
+            stage = "bootstrap"
             if self._ssh(ip, port, self._bootstrap_script(), min(60, remaining())) != 0:
                 raise RuntimeError("Pod is missing git, runpodctl, or a visible NVIDIA GPU")
             if spec.source_dir is not None:
+                stage = "source_archive"
                 archive = self._source_archive(spec)
                 try:
+                    stage = "source_upload"
                     if not self._upload_source(ip, port, archive, min(120, remaining())):
                         raise RuntimeError("could not upload the local source archive")
                 finally:
                     archive.unlink(missing_ok=True)
             try:
+                stage = "job"
                 reserve = min(120, max(30, spec.max_minutes * 6))
                 job_budget = remaining() - reserve
                 if job_budget <= 0:
@@ -554,6 +637,8 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             finally:
                 if ip is not None and port is not None:
                     for artifact in spec.artifacts:
+                        previous_stage = stage
+                        stage = "artifact_fetch"
                         try:
                             fetch_budget = min(120, remaining())
                         except TimeoutError:
@@ -563,6 +648,10 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                         )
                         if artifact.required and not fetched:
                             artifacts_ok = False
+                        stage = previous_stage
+        except BaseException as error:
+            failure = error
+            raise
         finally:
             # Once teardown begins, a second Ctrl-C/SIGTERM must not interrupt it.
             if previous_handlers and threading.current_thread() is threading.main_thread():
@@ -635,14 +724,19 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             finally:
                 for signum, handler in previous_handlers.items():
                     signal.signal(signum, handler)
+            result = JobResult(
+                pod_id=pod_id, returncode=returncode,
+                timed_out=timed_out or isinstance(failure, (TimeoutError, subprocess.TimeoutExpired)),
+                artifacts_ok=artifacts_ok, terminated=terminated,
+                elapsed_seconds=time.monotonic() - started, cost_per_hour=cost,
+                paused=paused, retest_expires_at=retest_expires_at,
+                requested=spec.receipt, job_started=job_started,
+                failure_stage=stage if failure is not None else None,
+            )
+            if failure is not None:
+                failure.job_result = result
 
-        return JobResult(
-            pod_id=pod_id, returncode=returncode, timed_out=timed_out,
-            artifacts_ok=artifacts_ok, terminated=terminated,
-            elapsed_seconds=time.monotonic() - started, cost_per_hour=cost,
-            paused=paused, retest_expires_at=retest_expires_at,
-            requested=spec.receipt,
-        )
+        return result
 
     def reap(self, all_managed: bool = False) -> list[str]:
         self.reap_failures = []

@@ -181,10 +181,13 @@ class JobResult:
     fresh_fallback_max_minutes: int | None = None
     retained_pod_preserved_at_fallback: bool = False
     reuse_candidate_dispositions: tuple[str, ...] = ()
+    job_started: bool = False
+    failure_stage: str | None = None
 
     @property
     def ok(self) -> bool:
-        return (self.returncode == 0 and not self.timed_out and self.artifacts_ok and
+        return (self.failure_stage is None and self.returncode == 0 and
+                not self.timed_out and self.artifacts_ok and
                 (self.terminated or self.paused))
 
     def to_dict(self) -> dict[str, Any]:
@@ -203,5 +206,7 @@ class JobResult:
             "fresh_fallback_max_minutes": self.fresh_fallback_max_minutes,
             "retained_pod_preserved_at_fallback": self.retained_pod_preserved_at_fallback,
             "reuse_candidate_dispositions": list(self.reuse_candidate_dispositions),
+            "job_started": self.job_started,
+            "failure_stage": self.failure_stage,
             "ok": self.ok,
         }

@@ -236,6 +236,22 @@ if not result.ok:
     raise RuntimeError(result.to_dict())
 ```
 
+If provisioning or execution raises after the runner has accepted a Pod into its
+managed lifecycle, the original exception carries `error.job_result`, a `JobResult`
+created after teardown. Python callers can save `error.job_result.to_dict()` before
+re-raising. The CLI prints this final JSON receipt and exits with status 1 (130 for
+an interrupt). Errors before allocation or during retained-Pod validation still
+raise without a receipt.
+
+Failure receipts include the Pod ID, reported hourly rate, elapsed time, and the
+confirmed `terminated` or `paused` state. `failure_stage` identifies the operation
+(for example, `source_upload`) without including exception messages, commands, or
+environment values. `job_started` means the job SSH invocation was attempted; it
+does not prove the remote command began. A provisioning failure has a null
+`returncode` and `ok: false`. An unconfirmed deletion has `terminated: false` and
+keeps its lease for the reaper. The hourly rate and elapsed time are observations,
+not a provider billing total, especially when retained candidates were attempted.
+
 ## Scheduled reaper
 
 Install after the package itself. Store only the Runpod API key in
