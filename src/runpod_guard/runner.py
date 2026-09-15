@@ -339,6 +339,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             global_deadline = started + spec.max_minutes * 60
             dispositions: list[str] = []
             last_unavailable: RetainedPodUnavailable | None = None
+            last_managed_result: JobResult | None = None
             for pod_id in candidates:
                 candidate = replace(spec, reuse_pod_id=pod_id, reuse_pod_ids=())
                 with self.leases.claim(pod_id):
@@ -359,10 +360,20 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                                 error.job_result,
                                 reuse_candidate_dispositions=tuple(dispositions),
                             )
+                            last_managed_result = error.job_result
                     except BaseException as error:
-                        if isinstance(getattr(error, "job_result", None), JobResult):
+                        result = getattr(error, "job_result", None)
+                        if isinstance(result, JobResult):
                             error.job_result = replace(
-                                error.job_result,
+                                result,
+                                reuse_candidate_dispositions=tuple(dispositions + ["failed"]),
+                            )
+                        elif last_managed_result is not None:
+                            # A later candidate can fail validation before it has a
+                            # Pod receipt of its own. Keep the earlier managed result.
+                            error.job_result = replace(
+                                last_managed_result,
+                                failure_stage="retained_candidate",
                                 reuse_candidate_dispositions=tuple(dispositions + ["failed"]),
                             )
                         raise
@@ -381,7 +392,15 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             remaining_seconds = int(global_deadline - time.monotonic())
             fallback_minutes = remaining_seconds // 60
             if fallback_minutes < 1:
-                raise TimeoutError("no job budget remains for a fresh fallback")
+                error = TimeoutError("no job budget remains for a fresh fallback")
+                if last_managed_result is not None:
+                    error.job_result = replace(
+                        last_managed_result,
+                        timed_out=True,
+                        failure_stage="fresh_fallback_budget",
+                        reuse_candidate_dispositions=tuple(dispositions),
+                    )
+                raise error
             self._log("all retained Pods remained unavailable; allocating a fresh fallback")
             try:
                 fresh = self._execute(
@@ -390,10 +409,21 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                     monotonic_deadline=global_deadline,
                 )
             except BaseException as error:
-                if isinstance(getattr(error, "job_result", None), JobResult):
+                result = getattr(error, "job_result", None)
+                if isinstance(result, JobResult):
                     error.job_result = replace(
-                        error.job_result,
+                        result,
                         fresh_fallback_used=True,
+                        fresh_fallback_max_minutes=fallback_minutes,
+                        retained_pod_preserved_at_fallback=True,
+                        reuse_candidate_dispositions=tuple(dispositions),
+                    )
+                elif last_managed_result is not None:
+                    # Fresh setup can fail before allocation. The retained-Pod
+                    # receipt still proves the managed lifecycle already completed.
+                    error.job_result = replace(
+                        last_managed_result,
+                        failure_stage="fresh_fallback",
                         fresh_fallback_max_minutes=fallback_minutes,
                         retained_pod_preserved_at_fallback=True,
                         reuse_candidate_dispositions=tuple(dispositions),

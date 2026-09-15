@@ -641,16 +641,83 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             runner = self.runner(root)
             runner.leases.put("pod-1", {"pod_id": "pod-1", "state": "paused-for-retest"})
+            unavailable = RetainedPodUnavailable("busy", 500)
+            unavailable.job_result = JobResult(
+                pod_id="pod-1", returncode=None, timed_out=False,
+                artifacts_ok=True, terminated=False, paused=True, elapsed_seconds=1,
+                failure_stage="retained_start",
+            )
             spec = JobSpec(
                 repo="https://example/repo", ref="abc", command="pytest",
                 max_minutes=10, reuse_pod_id="pod-1",
                 fallback_fresh_on_reuse_unavailable=True,
             )
-            with patch.object(runner, "_execute", side_effect=RetainedPodUnavailable("busy", 500)) as execute, \
-                 patch("runpod_guard.runner.time.monotonic", side_effect=[0, 0, 600]), \
-                 self.assertRaisesRegex(TimeoutError, "no job budget remains"):
+            with patch.object(runner, "_execute", side_effect=unavailable) as execute, \
+                 patch("runpod_guard.runner.time.monotonic", side_effect=[0, 0, 600, 600]), \
+                 self.assertRaisesRegex(TimeoutError, "no job budget remains") as caught:
                 runner.execute(spec)
             execute.assert_called_once_with(spec, monotonic_deadline=600)
+            self.assertTrue(caught.exception.job_result.timed_out)
+            self.assertEqual("fresh_fallback_budget",
+                             caught.exception.job_result.failure_stage)
+            self.assertEqual(
+                ("unavailable-preserved",),
+                caught.exception.job_result.reuse_candidate_dispositions,
+            )
+
+    def test_ordered_reuse_keeps_receipt_when_later_candidate_fails_validation(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            for pod_id in ("pod-1", "pod-2"):
+                runner.leases.put(pod_id, {
+                    "pod_id": pod_id, "state": "paused-for-retest",
+                })
+            unavailable = RetainedPodUnavailable("busy", 500)
+            unavailable.job_result = JobResult(
+                pod_id="pod-1", returncode=None, timed_out=False,
+                artifacts_ok=True, terminated=False, paused=True, elapsed_seconds=1,
+                failure_stage="retained_start",
+            )
+            with patch.object(runner, "_execute", side_effect=[
+                    unavailable, RuntimeError("second candidate is invalid")]), \
+                 patch("runpod_guard.runner.time.monotonic", return_value=100), \
+                 self.assertRaisesRegex(RuntimeError, "second candidate") as caught:
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    reuse_pod_ids=("pod-1", "pod-2"),
+                ))
+            receipt = caught.exception.job_result
+            self.assertEqual("pod-1", receipt.pod_id)
+            self.assertEqual("retained_candidate", receipt.failure_stage)
+            self.assertEqual(
+                ("unavailable-preserved", "failed"),
+                receipt.reuse_candidate_dispositions,
+            )
+
+    def test_fresh_preallocation_failure_keeps_retained_receipt(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            runner.leases.put("pod-1", {"pod_id": "pod-1", "state": "paused-for-retest"})
+            unavailable = RetainedPodUnavailable("busy", 500)
+            unavailable.job_result = JobResult(
+                pod_id="pod-1", returncode=None, timed_out=False,
+                artifacts_ok=True, terminated=False, paused=True, elapsed_seconds=1,
+                failure_stage="retained_start",
+            )
+            with patch.object(runner, "_execute", side_effect=[
+                    unavailable, RuntimeError("fresh preallocation failed")]), \
+                 patch("runpod_guard.runner.time.monotonic", return_value=100), \
+                 self.assertRaisesRegex(RuntimeError, "fresh preallocation") as caught:
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, reuse_pod_id="pod-1",
+                    fallback_fresh_on_reuse_unavailable=True,
+                ))
+            receipt = caught.exception.job_result
+            self.assertEqual("fresh_fallback", receipt.failure_stage)
+            self.assertFalse(receipt.fresh_fallback_used)
+            self.assertTrue(receipt.retained_pod_preserved_at_fallback)
+            self.assertEqual(10, receipt.fresh_fallback_max_minutes)
 
     def test_ordered_reuse_advances_after_unavailable_candidate(self):
         with tempfile.TemporaryDirectory() as root:
