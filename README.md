@@ -138,6 +138,14 @@ API, cleanup, and timeout failures stop the run. All candidates share the origin
 `max_minutes` deadline. Fresh allocation remains separately opt-in and happens only
 after every candidate is unavailable. Receipts report the candidate count and safe
 dispositions without copying Pod IDs into the requested configuration.
+A candidate that returns an authoritative Pod lookup 404 is treated as already
+absent: its stale local lease is retired and the runner records `absent-retired`
+before trying the next explicit candidate. Network failures, timeouts, generic API
+errors, and ambiguous endpoint responses still stop the run. If no candidate can
+run, creating a fresh Pod still requires the explicit fresh-fallback option.
+This also covers a later candidate whose local lease was safely removed by the
+reaper while an earlier candidate was being tried, but only after a fresh lookup
+confirms that the provider no longer has that Pod.
 
 Pass `--retest-window-minutes` again to retain the Pod that ran the job. Retest jobs use
 a 20 GB Pod volume by default; adjust it with `--workspace-gb`. Runpod clears the
@@ -240,13 +248,15 @@ If provisioning or execution raises after the runner has accepted a Pod into its
 managed lifecycle, the original exception carries `error.job_result`, a `JobResult`
 created after teardown. Python callers can save `error.job_result.to_dict()` before
 re-raising. The CLI prints this final JSON receipt and exits with status 1 (130 for
-an interrupt). Errors before allocation or during retained-Pod validation still
-raise without a receipt.
+an interrupt). Other errors before allocation or during retained-Pod validation
+still raise without a receipt.
 
 Failure receipts include the Pod ID, reported hourly rate, elapsed time, and the
 confirmed `terminated` or `paused` state. `failure_stage` identifies the operation
 (for example, `source_upload`) without including exception messages, commands, or
-environment values. `job_started` means the job SSH invocation was attempted; it
+environment values. A confirmed stale retained candidate is the one pre-allocation
+case that receives a lifecycle receipt, with an empty Pod ID and `absent-retired`
+disposition. `job_started` means the job SSH invocation was attempted; it
 does not prove the remote command began. A provisioning failure has a null
 `returncode` and `ok: false`. An unconfirmed deletion has `terminated: false` and
 keeps its lease for the reaper. The hourly rate and elapsed time are observations,

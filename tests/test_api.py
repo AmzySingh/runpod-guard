@@ -4,7 +4,7 @@ import json
 import unittest
 import urllib.error
 
-from runpod_guard.api import RunpodAPI, RunpodAPIError
+from runpod_guard.api import RunpodAPI, RunpodAPIError, RunpodPodNotFound
 
 
 class Response:
@@ -51,6 +51,18 @@ class APITests(unittest.TestCase):
         self.assertTrue(RunpodAPIError("request timeout", 408).retryable)
         self.assertTrue(RunpodAPIError("rate limited", 429).retryable)
         self.assertFalse(RunpodAPIError("bad request", 400).retryable)
+
+    def test_only_get_pod_turns_404_into_confirmed_absence(self):
+        api = RunpodAPI("secret")
+        api.request = lambda *_args: (_ for _ in ()).throw(
+            RunpodAPIError("not found", 404)
+        )
+        with self.assertRaises(RunpodPodNotFound) as caught:
+            api.get_pod("example")
+        self.assertEqual(404, caught.exception.status_code)
+        with self.assertRaises(RunpodAPIError) as caught:
+            api.start_pod("example")
+        self.assertNotIsInstance(caught.exception, RunpodPodNotFound)
 
     def test_delete_is_confirmed_by_listing(self):
         api = RunpodAPI("secret")

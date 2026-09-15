@@ -10,9 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from runpod_guard.api import RunpodAPIError
+from runpod_guard.api import RunpodAPIError, RunpodPodNotFound
 from runpod_guard.models import Artifact, JobResult, JobSpec
-from runpod_guard.runner import RetainedPodUnavailable, RunpodRunner
+from runpod_guard.runner import RetainedPodLeaseMissing, RetainedPodUnavailable, RunpodRunner
 from runpod_guard.state import LeaseStore
 
 
@@ -761,6 +761,171 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(["pod-2"], api.started)
             self.assertEqual(["pod-2"], api.deleted)
             self.assertEqual("paused-for-retest", runner.leases.all()[0]["state"])
+
+    def test_ordered_reuse_retires_absent_candidate_then_uses_next(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, retest_window_minutes=15,
+                ))
+            first_lease = runner.leases.all()[0]
+            second_name = "retained-second"
+            api.pods["pod-2"] = {**api.pods["pod-1"], "id": "pod-2", "name": second_name}
+            runner.leases.put("pod-2", {
+                **{key: value for key, value in first_lease.items() if key != "_path"},
+                "pod_id": "pod-2", "name": second_name,
+            })
+            original_get = api.get_pod
+
+            def get_pod(pod_id):
+                if pod_id == "pod-1":
+                    raise RunpodPodNotFound("Runpod Pod was not found", 404)
+                return original_get(pod_id)
+
+            api.get_pod = get_pod
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="def", command="pytest",
+                    max_minutes=10, reuse_pod_ids=("pod-1", "pod-2"),
+                ))
+
+            self.assertTrue(result.ok)
+            self.assertEqual(("absent-retired", "used"),
+                             result.reuse_candidate_dispositions)
+            self.assertNotIn("pod-1", str(result.requested))
+            self.assertEqual(["pod-2"], api.started)
+            self.assertEqual([], runner.leases.all())
+
+    def test_absent_only_without_fresh_opt_in_returns_sanitized_receipt(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            runner.leases.put("pod-1", {"pod_id": "pod-1", "state": "paused-for-retest"})
+            spec = JobSpec(
+                repo="https://example/repo", ref="abc", command="pytest",
+                reuse_pod_ids=("pod-1",),
+            )
+            with patch.object(runner, "_execute",
+                              side_effect=RunpodPodNotFound("not found", 404)) as execute, \
+                 self.assertRaises(RunpodPodNotFound) as caught:
+                runner.execute(spec)
+
+            execute.assert_called_once()
+            receipt = caught.exception.job_result
+            self.assertEqual("", receipt.pod_id)
+            self.assertTrue(receipt.terminated)
+            self.assertFalse(receipt.ok)
+            self.assertEqual("retained_candidate_absent", receipt.failure_stage)
+            self.assertEqual(("absent-retired",), receipt.reuse_candidate_dispositions)
+            self.assertEqual(spec.receipt, receipt.requested)
+            self.assertEqual([], runner.leases.all())
+
+    def test_absent_only_can_use_opt_in_fresh_fallback(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            runner.leases.put("pod-1", {"pod_id": "pod-1", "state": "paused-for-retest"})
+            fresh = JobResult(
+                pod_id="fresh", returncode=0, timed_out=False, artifacts_ok=True,
+                terminated=True, elapsed_seconds=1,
+            )
+            with patch.object(runner, "_execute", side_effect=[
+                    RunpodPodNotFound("not found", 404), fresh]) as execute, \
+                 patch("runpod_guard.runner.time.monotonic", return_value=100):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, reuse_pod_ids=("pod-1",),
+                    fallback_fresh_on_reuse_unavailable=True,
+                ))
+
+            self.assertEqual(2, execute.call_count)
+            self.assertTrue(result.ok)
+            self.assertTrue(result.fresh_fallback_used)
+            self.assertFalse(result.retained_pod_preserved_at_fallback)
+            self.assertEqual(("absent-retired",), result.reuse_candidate_dispositions)
+
+    def test_fresh_flag_without_candidates_is_an_ordinary_fresh_run(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    fallback_fresh_on_reuse_unavailable=True,
+                ))
+            self.assertTrue(result.ok)
+            self.assertFalse(result.fresh_fallback_used)
+            self.assertEqual((), result.reuse_candidate_dispositions)
+
+    def test_reaped_local_lease_can_fall_back_after_fresh_absence_lookup(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            original_get = api.get_pod
+
+            def get_pod(pod_id):
+                if pod_id == "stale-candidate":
+                    raise RunpodPodNotFound("Runpod Pod was not found", 404)
+                return original_get(pod_id)
+
+            api.get_pod = get_pod
+            runner = self.runner(root, api)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                result = runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    max_minutes=10, reuse_pod_ids=("stale-candidate",),
+                    fallback_fresh_on_reuse_unavailable=True,
+                ))
+
+            self.assertTrue(result.ok)
+            self.assertTrue(result.fresh_fallback_used)
+            self.assertFalse(result.retained_pod_preserved_at_fallback)
+            self.assertEqual(("absent-retired",), result.reuse_candidate_dispositions)
+            self.assertIsNotNone(api.body)
+
+    def test_missing_local_lease_does_not_continue_when_provider_has_candidate(self):
+        with tempfile.TemporaryDirectory() as root:
+            api = FakeAPI()
+            runner = self.runner(root, api)
+            with self.assertRaises(RetainedPodLeaseMissing):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    reuse_pod_ids=("still-present", "next-candidate"),
+                    fallback_fresh_on_reuse_unavailable=True,
+                ))
+            self.assertIsNone(api.body)
+            self.assertEqual([], api.started)
+
+    def test_ambiguous_404_or_transient_error_does_not_advance_candidate(self):
+        for error in (RunpodAPIError("start endpoint returned 404", 404),
+                      RunpodAPIError("temporary lookup failure", 500)):
+            with self.subTest(status=error.status_code), tempfile.TemporaryDirectory() as root:
+                runner = self.runner(root)
+                with patch.object(runner, "_execute", side_effect=error) as execute, \
+                     self.assertRaises(RunpodAPIError):
+                    runner.execute(JobSpec(
+                        repo="https://example/repo", ref="abc", command="pytest",
+                        reuse_pod_ids=("pod-1", "pod-2"),
+                        fallback_fresh_on_reuse_unavailable=True,
+                    ))
+                self.assertEqual(1, execute.call_count)
+
+    def test_absent_candidate_lease_retirement_failure_aborts(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            with patch.object(runner, "_execute",
+                              side_effect=RunpodPodNotFound("not found", 404)) as execute, \
+                 patch.object(runner.leases, "remove", side_effect=OSError("disk failure")), \
+                 self.assertRaisesRegex(OSError, "disk failure"):
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="pytest",
+                    reuse_pod_ids=("pod-1", "pod-2"),
+                    fallback_fresh_on_reuse_unavailable=True,
+                ))
+            self.assertEqual(1, execute.call_count)
 
     def test_ordered_reuse_all_unavailable_needs_fresh_opt_in(self):
         with tempfile.TemporaryDirectory() as root:

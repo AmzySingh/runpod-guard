@@ -21,6 +21,10 @@ class RunpodAPIError(RuntimeError):
                 500 <= self.status_code < 600)
 
 
+class RunpodPodNotFound(RunpodAPIError):
+    """An authoritative Pod lookup reported that the Pod does not exist."""
+
+
 class RunpodAPI:
     def __init__(self, api_key: str, base_url: str = "https://rest.runpod.io/v1",
                  opener: Callable[..., Any] = urllib.request.urlopen) -> None:
@@ -74,7 +78,14 @@ class RunpodAPI:
         return pods
 
     def get_pod(self, pod_id: str) -> dict[str, Any]:
-        return self.request("GET", f"/pods/{pod_id}")
+        try:
+            return self.request("GET", f"/pods/{pod_id}")
+        except RunpodAPIError as error:
+            if error.status_code == 404:
+                # Keep this typed signal narrower than generic endpoint 404s. An
+                # ordered reuse caller may safely retire only a failed GET lookup.
+                raise RunpodPodNotFound("Runpod Pod was not found", 404) from None
+            raise
 
     def create_pod(self, body: dict[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/pods", body)
