@@ -64,6 +64,9 @@ def parser() -> argparse.ArgumentParser:
     source.add_argument("--repo", help="public HTTPS Git repository")
     source.add_argument("--source", type=Path,
                         help="local Git tree; uploads only files tracked at --ref")
+    run.add_argument("--source-path", action="append", default=[], metavar="PATH",
+                     help="literal tracked file/directory to upload; repeat for an allow-list "
+                          "(requires --source; default: full archive)")
     run.add_argument("--ref", required=True, help="commit SHA, tag, or branch")
     run.add_argument("--command", required=True, help="shell command inside the checkout")
     run.add_argument("--setup", default="", help="shell setup command before the job")
@@ -118,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     spec = JobSpec(
         repo=args.repo, source_dir=args.source, ref=args.ref,
+        source_paths=tuple(args.source_path),
         command=args.command, setup=args.setup,
         profile=args.profile, gpu_types=tuple(args.gpu), gpu_priority=args.gpu_priority,
         cloud=args.cloud,

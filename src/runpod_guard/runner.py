@@ -220,6 +220,27 @@ exit "$job_status"
 """
 
     @staticmethod
+    def _pin_source_selection(spec: JobSpec) -> JobSpec:
+        """Validate an allow-list before allocation and resolve its revision once."""
+        if not spec.source_paths:
+            return spec
+        source = spec.source_dir.expanduser().resolve()
+        git = ["git", "--literal-pathspecs", "-C", str(source)]
+        commit = subprocess.run(
+            [*git, "rev-parse", "--verify", "--end-of-options", f"{spec.ref}^{{commit}}"],
+            check=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            text=True, timeout=30,
+        ).stdout.strip()
+        for path in spec.source_paths:
+            entries = subprocess.run(
+                [*git, "ls-tree", "-r", "-z", "--name-only", commit, "--", path],
+                check=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, timeout=30,
+            ).stdout
+            if not entries:
+                raise ValueError(f"source path has no tracked files at the requested ref: {path!r}")
+        return replace(spec, ref=commit)
+
+    @staticmethod
     def _source_archive(spec: JobSpec) -> Path:
         if spec.source_dir is None:
             raise ValueError("source_dir is required")
@@ -229,8 +250,8 @@ exit "$job_status"
         handle.close()
         try:
             subprocess.run(
-                ["git", "-C", str(source), "archive", "--format=tar",
-                 f"--output={archive}", spec.ref],
+                ["git", "--literal-pathspecs", "-C", str(source), "archive", "--format=tar",
+                 f"--output={archive}", spec.ref, "--", *spec.source_paths],
                 check=True, stdin=subprocess.DEVNULL, timeout=120,
             )
             archive.chmod(0o600)
@@ -330,6 +351,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
         """Run a job; post-allocation exceptions carry a sanitized ``job_result``."""
         started = time.monotonic()
         try:
+            spec = self._pin_source_selection(spec)
             return self._execute_candidates(spec)
         except BaseException as error:
             # Keep the original exception type (including cancellation and retained
