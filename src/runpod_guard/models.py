@@ -58,12 +58,12 @@ class JobSpec:
     reuse_pod_id: str | None = None
     reuse_start_attempts: int = 4
     reuse_start_delay_seconds: int = 20
-    fallback_fresh_on_reuse_unavailable: bool = False
     artifacts: tuple[Artifact, ...] = ()
     name: str = "job"
     env: dict[str, str] = field(default_factory=dict)
     # Kept after the original fields so adding ordered reuse does not shift the
     # positional Python API. New callers should pass it by keyword.
+    fallback_fresh_on_reuse_unavailable: bool = False
     reuse_pod_ids: tuple[str, ...] = ()
     gpu_priority: str = "custom"
 

@@ -27,6 +27,17 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(ordered.receipt["reuse_candidate_count"], 2)
         self.assertNotIn("candidate-a", str(ordered.receipt))
 
+        artifact = Artifact("out/result")
+        positional = JobSpec(
+            "https://example/repo", "abc", "true", "", None, "small", (), "SECURE",
+            60, 1.0, "image", 40, 20, 0, None, 4, 20, (artifact,), "positional",
+            {"KEY": "value"},
+        )
+        self.assertEqual(positional.artifacts, (artifact,))
+        self.assertEqual(positional.name, "positional")
+        self.assertEqual(positional.env, {"KEY": "value"})
+        self.assertFalse(positional.fallback_fresh_on_reuse_unavailable)
+
     def test_rejects_unsafe_values(self):
         with self.assertRaises(ValueError):
             Artifact("../outside")
