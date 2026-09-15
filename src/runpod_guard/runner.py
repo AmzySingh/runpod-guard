@@ -17,13 +17,17 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
-from .api import RunpodAPI, RunpodAPIError
+from .api import RunpodAPI, RunpodAPIError, RunpodPodNotFound
 from .models import Artifact, JobResult, JobSpec
 from .state import LeaseStore
 
 
 class RetainedPodUnavailable(RunpodAPIError):
     """A retained Pod stayed stopped after every retryable start attempt."""
+
+
+class RetainedPodLeaseMissing(RuntimeError):
+    """No local retained lease remains for an explicitly requested Pod."""
 
 
 class RunpodRunner:
@@ -275,9 +279,13 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
 
     def _retained_lease(self, pod_id: str) -> dict:
         now = datetime.now(timezone.utc)
+        found = False
         for lease in self.leases.all():
-            if lease.get("pod_id") != pod_id or lease.get("api_identity") != self.api.identity:
+            if lease.get("pod_id") != pod_id:
                 continue
+            found = True
+            if lease.get("api_identity") != self.api.identity:
+                break
             try:
                 expires = datetime.fromisoformat(lease["expires_at"])
             except (KeyError, TypeError, ValueError):
@@ -286,6 +294,10 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                     expires > now):
                 return lease
             break
+        if not found:
+            raise RetainedPodLeaseMissing(
+                f"{pod_id} no longer has a local retained lease"
+            )
         raise RuntimeError(f"{pod_id} is not an unexpired Pod retained by this API identity")
 
     def extend_retest(self, pod_id: str, minutes: int) -> str:
@@ -338,15 +350,49 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
             started = time.monotonic()
             global_deadline = started + spec.max_minutes * 60
             dispositions: list[str] = []
-            last_unavailable: RetainedPodUnavailable | None = None
+            last_candidate_error: BaseException | None = None
             last_managed_result: JobResult | None = None
+
+            def retire_absent(error: RunpodPodNotFound, pod_id: str) -> JobResult:
+                # Lease removal is part of the proof. If local storage fails, its
+                # exception aborts this run rather than advancing ambiguously.
+                self.leases.remove(pod_id)
+                dispositions.append("absent-retired")
+                result = JobResult(
+                    pod_id="", returncode=None, timed_out=False,
+                    artifacts_ok=True, terminated=True,
+                    elapsed_seconds=time.monotonic() - started,
+                    requested=spec.receipt,
+                    failure_stage="retained_candidate_absent",
+                    reuse_candidate_dispositions=tuple(dispositions),
+                )
+                error.job_result = result
+                return result
+
             for pod_id in candidates:
                 candidate = replace(spec, reuse_pod_id=pod_id, reuse_pod_ids=())
                 with self.leases.claim(pod_id):
                     try:
                         result = self._execute(candidate, monotonic_deadline=global_deadline)
+                    except RetainedPodLeaseMissing as lease_error:
+                        # A reaper can remove a later candidate while an earlier
+                        # candidate is being tried. Continue only if an authoritative
+                        # lookup independently proves the now-unleased Pod is absent.
+                        try:
+                            self.api.get_pod(pod_id)
+                        except RunpodPodNotFound as error:
+                            last_managed_result = retire_absent(error, pod_id)
+                            last_candidate_error = error
+                        else:
+                            raise lease_error
+                    except RunpodPodNotFound as error:
+                        # A typed GET 404 proves this candidate cannot still be
+                        # running. Retire its stale local lease while its claim is
+                        # held, then continue without exposing its ID in the receipt.
+                        last_managed_result = retire_absent(error, pod_id)
+                        last_candidate_error = error
                     except RetainedPodUnavailable as error:
-                        last_unavailable = error
+                        last_candidate_error = error
                         leases = [lease for lease in self.leases.all()
                                   if lease.get("pod_id") == pod_id]
                         if len(leases) != 1 or leases[0].get("state") != "paused-for-retest":
@@ -358,6 +404,13 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                         if isinstance(getattr(error, "job_result", None), JobResult):
                             error.job_result = replace(
                                 error.job_result,
+                                reuse_candidate_dispositions=tuple(dispositions),
+                            )
+                            last_managed_result = error.job_result
+                        elif last_managed_result is not None:
+                            error.job_result = replace(
+                                last_managed_result,
+                                failure_stage="retained_start",
                                 reuse_candidate_dispositions=tuple(dispositions),
                             )
                             last_managed_result = error.job_result
@@ -386,9 +439,9 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                             reuse_candidate_dispositions=tuple(dispositions),
                         )
             if not spec.fallback_fresh_on_reuse_unavailable:
-                if last_unavailable is None:
+                if last_candidate_error is None:
                     raise RuntimeError("no retained Pod candidate was attempted")
-                raise last_unavailable
+                raise last_candidate_error
             remaining_seconds = int(global_deadline - time.monotonic())
             fallback_minutes = remaining_seconds // 60
             if fallback_minutes < 1:
@@ -401,7 +454,8 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                         reuse_candidate_dispositions=tuple(dispositions),
                     )
                 raise error
-            self._log("all retained Pods remained unavailable; allocating a fresh fallback")
+            self._log("no retained Pod candidate could start; allocating a fresh fallback")
+            retained_preserved = "unavailable-preserved" in dispositions
             try:
                 fresh = self._execute(
                     replace(spec, reuse_pod_id=None, reuse_pod_ids=(),
@@ -415,7 +469,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                         result,
                         fresh_fallback_used=True,
                         fresh_fallback_max_minutes=fallback_minutes,
-                        retained_pod_preserved_at_fallback=True,
+                        retained_pod_preserved_at_fallback=retained_preserved,
                         reuse_candidate_dispositions=tuple(dispositions),
                     )
                 elif last_managed_result is not None:
@@ -425,7 +479,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                         last_managed_result,
                         failure_stage="fresh_fallback",
                         fresh_fallback_max_minutes=fallback_minutes,
-                        retained_pod_preserved_at_fallback=True,
+                        retained_pod_preserved_at_fallback=retained_preserved,
                         reuse_candidate_dispositions=tuple(dispositions),
                     )
                 raise
@@ -435,7 +489,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 requested=spec.receipt,
                 fresh_fallback_used=True,
                 fresh_fallback_max_minutes=fallback_minutes,
-                retained_pod_preserved_at_fallback=True,
+                retained_pod_preserved_at_fallback=retained_preserved,
                 reuse_candidate_dispositions=tuple(dispositions),
             )
         return self._execute(spec)
