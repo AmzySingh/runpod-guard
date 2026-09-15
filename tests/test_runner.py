@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import json
 import threading
 import unittest
 import subprocess
@@ -10,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from runpod_guard.api import RunpodAPIError
-from runpod_guard.models import JobResult, JobSpec
+from runpod_guard.models import Artifact, JobResult, JobSpec
 from runpod_guard.runner import RetainedPodUnavailable, RunpodRunner
 from runpod_guard.state import LeaseStore
 
@@ -76,6 +77,8 @@ class RunnerTests(unittest.TestCase):
                                                 command="python test.py", max_minutes=10,
                                                 max_cost_per_hour=0.5))
             self.assertTrue(result.ok)
+            self.assertTrue(result.job_started)
+            self.assertIsNone(result.failure_stage)
             self.assertEqual(api.deleted, ["pod-1"])
             self.assertEqual(api.body["volumeInGb"], 0)
             self.assertEqual(api.body["gpuTypePriority"], "custom")
@@ -559,7 +562,7 @@ class RunnerTests(unittest.TestCase):
                 RunpodAPIError("temporary server error", 500)
             )
             with patch("runpod_guard.runner.time.sleep", side_effect=lambda _: signal.raise_signal(
-                    signal.SIGTERM)), self.assertRaises(KeyboardInterrupt):
+                    signal.SIGTERM)), self.assertRaises(KeyboardInterrupt) as caught:
                 runner.execute(JobSpec(
                     repo="https://example/repo", ref="def", command="pytest",
                     max_minutes=10, reuse_pod_id="pod-1",
@@ -569,6 +572,9 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(first.retest_expires_at, lease["expires_at"])
             self.assertEqual(["pod-1"], api.stopped)
             self.assertIs(signal.getsignal(signal.SIGTERM), original_handler)
+            self.assertTrue(caught.exception.job_result.paused)
+            self.assertFalse(caught.exception.job_result.job_started)
+            self.assertEqual(caught.exception.job_result.failure_stage, "retained_start")
 
     def test_reuse_does_not_retry_permanent_start_failure(self):
         with tempfile.TemporaryDirectory() as root:
@@ -641,7 +647,7 @@ class RunnerTests(unittest.TestCase):
                 fallback_fresh_on_reuse_unavailable=True,
             )
             with patch.object(runner, "_execute", side_effect=RetainedPodUnavailable("busy", 500)) as execute, \
-                 patch("runpod_guard.runner.time.monotonic", side_effect=[0, 600]), \
+                 patch("runpod_guard.runner.time.monotonic", side_effect=[0, 0, 600]), \
                  self.assertRaisesRegex(TimeoutError, "no job budget remains"):
                 runner.execute(spec)
             execute.assert_called_once_with(spec, monotonic_deadline=600)
@@ -862,6 +868,114 @@ class RunnerTests(unittest.TestCase):
                                        max_cost_per_hour=0.10))
             self.assertEqual(api.deleted, ["pod-1"])
 
+    def test_upload_failure_receipt_follows_teardown_without_starting_job(self):
+        for upload_error in (None, RuntimeError("private transport detail"),
+                             subprocess.TimeoutExpired("secret command", 120)):
+            for deletion in (True, False, RunpodAPIError("private API detail")):
+                with self.subTest(upload_error=upload_error, deletion=deletion), \
+                     tempfile.TemporaryDirectory() as root:
+                    runner = self.runner(root)
+                    archive = Path(root) / "source.tar"
+                    archive.touch()
+                    (Path(root) / ".git").mkdir()
+                    spec = JobSpec(
+                        repo=None, source_dir=Path(root), ref="abc", command="secret command",
+                        env={"TOKEN": "secret value"}, retest_window_minutes=15,
+                    )
+                    original_handler = signal.getsignal(signal.SIGTERM)
+                    with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                         patch.object(runner, "_wait_for_ssh"), \
+                         patch.object(runner, "_ssh", return_value=0) as ssh, \
+                         patch.object(runner, "_source_archive", return_value=archive), \
+                         patch.object(runner, "_upload_source", return_value=False,
+                                      side_effect=upload_error) as upload, \
+                         patch.object(runner, "_fetch") as fetch, \
+                         patch.object(runner.api, "delete_and_confirm", return_value=deletion,
+                                      side_effect=deletion if isinstance(deletion, Exception) else None) as delete, \
+                         self.assertRaises(type(upload_error) if upload_error else RuntimeError) as caught:
+                        runner.execute(spec)
+                    result = caught.exception.job_result
+                    self.assertEqual(result.pod_id, "pod-1")
+                    self.assertEqual(result.failure_stage, "source_upload")
+                    self.assertFalse(result.job_started)
+                    self.assertIsNone(result.returncode)
+                    self.assertFalse(result.ok)
+                    self.assertFalse(result.paused)
+                    self.assertEqual(result.terminated, deletion is True)
+                    self.assertEqual(result.timed_out, isinstance(upload_error, subprocess.TimeoutExpired))
+                    self.assertEqual(result.cost_per_hour, 0.4)
+                    self.assertGreaterEqual(result.elapsed_seconds, 0)
+                    self.assertEqual(result.requested, spec.receipt)
+                    self.assertNotIn("secret", json.dumps(result.to_dict()))
+                    self.assertNotIn("private", json.dumps(result.to_dict()))
+                    self.assertEqual(ssh.call_count, 2)  # Watchdog and bootstrap only.
+                    upload.assert_called_once()
+                    fetch.assert_not_called()
+                    delete.assert_called_once_with("pod-1")
+                    self.assertEqual(bool(runner.leases.all()), deletion is not True)
+                    self.assertFalse(archive.exists())
+                    self.assertIs(signal.getsignal(signal.SIGTERM), original_handler)
+                    if upload_error is not None:
+                        self.assertIs(caught.exception, upload_error)
+
+    def test_job_exception_receipt_keeps_stage_after_artifact_fetch(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), \
+                 patch.object(runner, "_ssh", side_effect=[0, 0, RuntimeError("transport")]), \
+                 patch.object(runner, "_fetch", return_value=True), \
+                 self.assertRaises(RuntimeError) as caught:
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="true",
+                    artifacts=(Artifact("output"),),
+                ))
+            result = caught.exception.job_result
+            self.assertTrue(result.job_started)
+            self.assertEqual(result.failure_stage, "job")
+            self.assertTrue(result.terminated)
+
+    def test_failed_fresh_fallback_receipt_keeps_request_and_dispositions(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            runner.leases.put("retained", {"pod_id": "retained", "state": "paused-for-retest"})
+            spec = JobSpec(
+                repo="https://example/repo", ref="abc", command="true", max_minutes=10,
+                reuse_pod_id="retained", fallback_fresh_on_reuse_unavailable=True,
+            )
+            error = RuntimeError("upload failed")
+            error.job_result = JobResult(
+                pod_id="fresh", returncode=None, timed_out=False, artifacts_ok=True,
+                terminated=True, elapsed_seconds=1, failure_stage="source_upload",
+            )
+            with patch.object(runner, "_execute", side_effect=[RetainedPodUnavailable("busy"), error]), \
+                 patch("runpod_guard.runner.time.monotonic", return_value=100), \
+                 self.assertRaises(RuntimeError) as caught:
+                runner.execute(spec)
+            result = caught.exception.job_result
+            self.assertEqual(result.requested, spec.receipt)
+            self.assertTrue(result.fresh_fallback_used)
+            self.assertEqual(result.fresh_fallback_max_minutes, 10)
+            self.assertTrue(result.retained_pod_preserved_at_fallback)
+            self.assertEqual(result.reuse_candidate_dispositions, ("unavailable-preserved",))
+
+    def test_artifact_exception_cannot_report_success_after_zero_job_exit(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0), \
+                 patch.object(runner, "_fetch", side_effect=OSError("disk full")), \
+                 self.assertRaises(OSError) as caught:
+                runner.execute(JobSpec(
+                    repo="https://example/repo", ref="abc", command="true",
+                    artifacts=(Artifact("output"),),
+                ))
+            result = caught.exception.job_result
+            self.assertEqual(result.returncode, 0)
+            self.assertTrue(result.terminated)
+            self.assertEqual(result.failure_stage, "artifact_fetch")
+            self.assertFalse(result.ok)
+
     def test_nonfinite_provider_cost_fails_closed(self):
         with tempfile.TemporaryDirectory() as root:
             api = FakeAPI()
@@ -917,9 +1031,11 @@ class RunnerTests(unittest.TestCase):
                 return original_put(key, value)
 
             runner.leases.put = fail_second_put
-            with self.assertRaises(OSError):
+            with self.assertRaises(OSError) as caught:
                 runner.execute(JobSpec(repo="https://example/repo", ref="y", command="z"))
             self.assertEqual(api.deleted, ["pod-1"])
+            self.assertEqual(caught.exception.job_result.failure_stage, "lease")
+            self.assertTrue(caught.exception.job_result.terminated)
             self.assertIs(signal.getsignal(signal.SIGINT), original_int)
             self.assertIs(signal.getsignal(signal.SIGTERM), original_term)
 

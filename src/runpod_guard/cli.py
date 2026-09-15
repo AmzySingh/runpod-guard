@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from .models import Artifact, GPU_PROFILES, JobSpec
+from .models import Artifact, GPU_PROFILES, JobResult, JobSpec
 from .runner import RunpodRunner
 
 
@@ -131,7 +131,14 @@ def main(argv: list[str] | None = None) -> int:
         fallback_fresh_on_reuse_unavailable=args.fallback_fresh_on_reuse_unavailable,
         artifacts=tuple(args.fetch), name=args.name,
     )
-    result = runner.execute(spec)
+    try:
+        result = runner.execute(spec)
+    except (Exception, KeyboardInterrupt) as error:
+        result = getattr(error, "job_result", None)
+        if not isinstance(result, JobResult):
+            raise
+        print(json.dumps(result.to_dict(), indent=2))
+        return 130 if isinstance(error, KeyboardInterrupt) else 1
     print(json.dumps(result.to_dict(), indent=2))
     return 0 if result.ok else 1
 
