@@ -261,16 +261,47 @@ exit "$job_status"
             raise
 
     def _upload_source(self, ip: str, port: int, archive: Path, timeout: int) -> bool:
-        command = [
-            "scp", "-P", str(port), "-i", str(self.ssh_key),
-            "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
-            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-            str(archive), f"root@{ip}:/tmp/runpod-guard-source.tar",
-        ]
-        try:
-            return subprocess.run(command, timeout=timeout).returncode == 0
-        except subprocess.TimeoutExpired:
-            return False
+        # Only this pre-job transfer is replayable. Every retry shares the caller's
+        # remaining lifetime; never grant a new job budget after a transport error.
+        deadline = time.monotonic() + timeout
+        staged: list[str] = []
+
+        def remaining() -> int:
+            seconds = int(deadline - time.monotonic())
+            if seconds <= 0:
+                raise TimeoutError("source upload exhausted the remaining job deadline")
+            return seconds
+
+        for attempt in range(1, 4):
+            transfer_budget = min(120, remaining())
+            # A disconnected remote scp may still be writing. Give each attempt a
+            # distinct inode, and expose it to the job only after scp confirms success.
+            remote = f"/tmp/runpod-guard-source-{uuid.uuid4().hex}.part"
+            staged.append(remote)
+            command = [
+                "scp", "-P", str(port), "-i", str(self.ssh_key),
+                "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
+                "-o", "ForwardAgent=no", "-o", "IdentitiesOnly=yes",
+                "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ServerAliveInterval=20", "-o", "ServerAliveCountMax=3",
+                str(archive), f"root@{ip}:{remote}",
+            ]
+            try:
+                if subprocess.run(command, timeout=transfer_budget).returncode == 0:
+                    promote = (
+                        "set -eu\n"
+                        f"mv -f -- {remote} /tmp/runpod-guard-source.tar\n"
+                        f"rm -f -- {' '.join(staged)}\n"
+                    )
+                    if self._ssh(ip, port, promote, min(30, remaining())) == 0:
+                        return True
+            except subprocess.TimeoutExpired:
+                pass
+            if attempt < 3:
+                delay = min(5, remaining())
+                self._log(f"source upload attempt {attempt}/3 failed; retrying in {delay} seconds")
+                time.sleep(delay)
+        return False
 
     def _fetch(self, ip: str, port: int, artifact: Artifact, timeout: int = 120,
                persistent_workspace: bool = False) -> bool:
@@ -691,7 +722,7 @@ case "$candidate" in {job_root}/*) exit 0;; *) exit 1;; esac
                 archive = self._source_archive(spec)
                 try:
                     stage = "source_upload"
-                    if not self._upload_source(ip, port, archive, min(120, remaining())):
+                    if not self._upload_source(ip, port, archive, remaining()):
                         raise RuntimeError("could not upload the local source archive")
                 finally:
                     archive.unlink(missing_ok=True)
