@@ -8,7 +8,7 @@ import subprocess
 import signal
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from runpod_guard.api import RunpodAPIError, RunpodPodNotFound
 from runpod_guard.models import Artifact, JobResult, JobSpec
@@ -1090,6 +1090,144 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("tracked.txt", archives)
             self.assertNotIn(".env", archives)
             self.assertIn("tar -xf /tmp/runpod-guard-source.tar", scripts[2])
+
+    def test_upload_retries_transfer_and_confirmation_before_starting_job_once(self):
+        for retained in (False, True):
+            for first_failure in (255, subprocess.TimeoutExpired("scp", 120), "confirmation"):
+                with self.subTest(retained=retained, first_failure=first_failure), \
+                     tempfile.TemporaryDirectory() as root:
+                    runner = self.runner(root)
+                    (Path(root) / ".git").mkdir()
+                    spec = JobSpec(repo=None, source_dir=Path(root), ref="abc", command="true",
+                                   max_minutes=10, retest_window_minutes=15)
+                    if retained:
+                        with patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                             patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0):
+                            runner.execute(JobSpec(repo="https://example/repo", ref="abc", command="true",
+                                                   max_minutes=10, retest_window_minutes=15))
+                        spec = JobSpec(repo=None, source_dir=Path(root), ref="abc", command="true",
+                                       max_minutes=10, retest_window_minutes=15, reuse_pod_id="pod-1")
+                    archive = Path(root) / "source.tar"
+                    archive.touch()
+                    transfers = [Mock(returncode=0 if first_failure == "confirmation" else first_failure),
+                                 Mock(returncode=0)]
+                    if isinstance(first_failure, Exception):
+                        transfers[0] = first_failure
+                    scripts = []
+                    promotions = []
+
+                    def ssh(_ip, _port, script, _timeout):
+                        scripts.append(script)
+                        if "mv -f --" in script:
+                            promotions.append(script)
+                            if first_failure == "confirmation" and len(promotions) == 1:
+                                return 255
+                        return 0
+
+                    with patch.object(runner, "_public_key", return_value=runner._public_key()), \
+                         patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                         patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", side_effect=ssh), \
+                         patch.object(runner, "_source_archive", return_value=archive), \
+                         patch("runpod_guard.runner.subprocess.run", side_effect=transfers) as transfer, \
+                         patch("runpod_guard.runner.time.sleep") as sleep:
+                        result = runner.execute(spec)
+                    self.assertTrue(result.ok)
+                    self.assertTrue(result.paused)
+                    self.assertEqual(transfer.call_count, 2)
+                    sleep.assert_called_once_with(5)
+                    destinations = [call.args[0][-1] for call in transfer.call_args_list]
+                    self.assertNotEqual(*destinations)
+                    self.assertTrue(all(path.endswith(".part") for path in destinations))
+                    self.assertTrue(all(call.kwargs["timeout"] <= 120 for call in transfer.call_args_list))
+                    for destination in destinations:
+                        self.assertIn(destination.split(":", 1)[1], promotions[-1])
+                    self.assertEqual(sum("tar -xf /tmp/runpod-guard-source.tar" in s for s in scripts), 1)
+                    self.assertFalse(archive.exists())
+
+    def test_upload_exhaustion_never_promotes_or_starts_job(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            (Path(root) / ".git").mkdir()
+            archive = Path(root) / "source.tar"
+            archive.touch()
+            with patch.object(runner, "_public_key", return_value=runner._public_key()), \
+                 patch.object(runner, "_wait_for_address", return_value=("127.0.0.1", 22)), \
+                 patch.object(runner, "_wait_for_ssh"), patch.object(runner, "_ssh", return_value=0) as ssh, \
+                 patch.object(runner, "_source_archive", return_value=archive), \
+                 patch("runpod_guard.runner.subprocess.run", return_value=Mock(returncode=255)) as transfer, \
+                 patch("runpod_guard.runner.time.sleep") as sleep, \
+                 self.assertRaisesRegex(RuntimeError, "could not upload") as caught:
+                runner.execute(JobSpec(repo=None, source_dir=Path(root), ref="abc", command="true"))
+            self.assertEqual(transfer.call_count, 3)
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(ssh.call_count, 2)  # Watchdog and bootstrap only.
+            self.assertFalse(caught.exception.job_result.job_started)
+            self.assertEqual(caught.exception.job_result.failure_stage, "source_upload")
+            self.assertTrue(caught.exception.job_result.terminated)
+            self.assertFalse(archive.exists())
+
+    def test_upload_retries_share_deadline_and_shrink_timeouts(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            clock = [100.0]
+            budgets = []
+
+            def transfer(_command, timeout):
+                budgets.append(timeout)
+                clock[0] += timeout
+                raise subprocess.TimeoutExpired("scp", timeout)
+
+            def sleep(seconds):
+                clock[0] += seconds
+
+            with patch("runpod_guard.runner.time.monotonic", side_effect=lambda: clock[0]), \
+                 patch("runpod_guard.runner.time.sleep", side_effect=sleep), \
+                 patch("runpod_guard.runner.subprocess.run", side_effect=transfer), \
+                 patch.object(runner, "_ssh") as ssh, \
+                 self.assertRaisesRegex(TimeoutError, "remaining job deadline"):
+                runner._upload_source("127.0.0.1", 22, Path(root) / "source.tar", 130)
+            self.assertEqual(budgets, [120, 5])
+            self.assertEqual(clock[0], 230)
+            ssh.assert_not_called()
+
+    def test_upload_promotes_complete_archive_and_removes_partial_attempts(self):
+        with tempfile.TemporaryDirectory() as root:
+            runner = self.runner(root)
+            remote_dir = Path(root) / "remote"
+            remote_dir.mkdir()
+            destination = remote_dir / "runpod-guard-source.tar"
+            destination.write_bytes(b"previous archive")
+            run_process = subprocess.run
+            transfers = []
+
+            def transfer(command, timeout):
+                path = remote_dir / command[-1].split("/")[-1]
+                transfers.append(path)
+                path.write_bytes(b"partial" if len(transfers) == 1 else b"complete archive")
+                self.assertEqual(destination.read_bytes(), b"previous archive")
+                return Mock(returncode=255 if len(transfers) == 1 else 0)
+
+            def ssh(_ip, _port, script, timeout):
+                return run_process(["bash", "-s"], input=script.replace("/tmp/", f"{remote_dir}/"),
+                                   text=True, timeout=timeout).returncode
+
+            with patch("runpod_guard.runner.subprocess.run", side_effect=transfer), \
+                 patch.object(runner, "_ssh", side_effect=ssh), \
+                 patch("runpod_guard.runner.time.sleep"):
+                self.assertTrue(runner._upload_source("127.0.0.1", 22, Path(root) / "source.tar", 600))
+            self.assertEqual(destination.read_bytes(), b"complete archive")
+            self.assertFalse(any(path.exists() for path in transfers))
+
+    def test_upload_does_not_retry_cancellation_or_local_errors(self):
+        for error in (KeyboardInterrupt(), FileNotFoundError("scp")):
+            with self.subTest(error=type(error)), tempfile.TemporaryDirectory() as root:
+                runner = self.runner(root)
+                with patch("runpod_guard.runner.subprocess.run", side_effect=error) as transfer, \
+                     patch("runpod_guard.runner.time.sleep") as sleep, \
+                     self.assertRaises(type(error)):
+                    runner._upload_source("127.0.0.1", 22, Path(root) / "source.tar", 600)
+                transfer.assert_called_once()
+                sleep.assert_not_called()
 
     def test_over_budget_still_deletes(self):
         with tempfile.TemporaryDirectory() as root:

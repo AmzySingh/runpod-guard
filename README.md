@@ -195,6 +195,13 @@ runpod-guard run \
   --command 'python -m project.model_test'
 ```
 
+Local source uploads get up to three attempts if the transfer or its confirmation
+fails. Each transfer is limited to 120 seconds, with a five-second pause between
+attempts. Transfers, confirmation, and pauses all use the original `max_minutes`
+budget. Each attempt writes a separate temporary file; only a completed transfer is
+renamed to the archive used by the job. Failed uploads never start the job, and this
+retry does not replay setup, commands, or inference.
+
 For a large checkout, repeat `--source-path` to upload only the files and directories
 needed by the job:
 
